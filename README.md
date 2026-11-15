@@ -265,7 +265,8 @@ REPENTOGON 可用？
 ## 6. 目录结构与上传范围
 
 **上传用的核心代码 = `metadata.xml` + `main.lua` + `scripts/**/*.lua`**（共 11 个文件）。
-其余目录只留在仓库里，**不参与模组运行、也不进发布包**。
+公开仓库 / 发布包里也只有这 11 个文件 + `README.md` / `.gitignore` / `.gitattributes` / `tools/package.ps1`；
+其余目录**只留在本地开发环境**，既不进公开仓库、也不进 zip。
 
 ```
 # ---- 核心代码（会打进模组 / zip） ----
@@ -282,7 +283,7 @@ scripts/
   chain.lua                 -- 最优放置链搜索（Beam Search + 协程分帧）
   ui.lua                    -- HUD 面板绘制（字体与渲染接口自适应）
 
-# ---- 只留在仓库里（不上传） ----
+# ---- 只留在本地（不在公开仓库里，也不上传） ----
 README.md                   -- 本开发文档（工坊页面另填）
 prompts/                    -- step1~5 交接文档（step1~3 勿改）
 tests/                      -- 离线测试（stub + 断言 + 模糊测试 + explore_reachable_bags.py 穷举参考）
@@ -297,6 +298,9 @@ tools/package.ps1           -- 打包脚本（白名单 → dist\CainsBag + zip�
 
 ## 7. 开发自测
 
+> `tests/` 与 `prompts/` 只在本地开发环境保留（`.gitignore` 已排除，公开仓库不含测试代码）。
+> 需要在公开仓库里带测试时，把 `.gitignore` 里的 `tests/`、`.github/` 去掉再提交即可。
+
 ```powershell
 pip install lupa          # 一次性
 python tests/run_tests.py # 逻辑 + 编辑器 + 模糊 + 集成 + UI 探测
@@ -306,7 +310,8 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 
 当前结果：`run_tests.py` → **267 条断言全绿（0 失败）**；`check_encoding.py` → 28 个文件无问题。
 
-推送 / PR 时 GitHub Actions 会自动跑上面两条命令（`.github/workflows/tests.yml`，Windows + Python 3.11/3.12）。
+> GitHub Actions 工作流（`.github/workflows/tests.yml`，Windows + Python 3.11/3.12）在本地保留，
+> 与 `tests/` 一样不随公开仓库上传；要启用 CI 就把 `.gitignore` 里的 `tests/`、`.github/` 去掉再提交。
 
 `tests/` 用 Lua 桩模拟原生 API，覆盖：
 
@@ -384,21 +389,24 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 
 ## 10. 发布 / 上传
 
-### 10.1 首次上传到 GitHub
+### 10.1 首次上传到 GitHub（已完成，留作参考）
+
+当前远端：`https://github.com/wong-songxin/Cain-s-bag-planner`（分支 `main`，只含核心代码）。
+本地的完整开发历史保存在分支 `dev-history`（含 `prompts/`、`tests/`、CI 工作流，**未推送**）。
 
 ```powershell
 cd "E:\Code\MOD\Cain's-bag"          # 目录名带单引号，PowerShell 用双引号包住
 git init -b main
-git add .
-git commit -m "Cain's Bag Planner：合成袋最优放置链 + 拾取归属 + 合成自动清空"
-git remote add origin https://github.com/<用户名>/CainsBag.git
+git add .gitattributes .gitignore README.md main.lua metadata.xml scripts tools
+git commit -m "Cain's Bag Planner 0.7.0：合成袋最优放置链 + 拾取归属 + 配方史（仅核心代码）"
+git remote add origin https://github.com/wong-songxin/Cain-s-bag-planner.git
 git push -u origin main
 ```
 
 - 仓库名建议 `CainsBag`：GitHub 仓库名不接受 `'`（`Cain's-bag` 会被改成 `Cain-s-bag`），而模组目录名本来就该是 `CainsBag`；
 - 仓库描述 / Topics 建议：`isaac`、`repentance`、`mod`、`tainted-cain`、`bag-of-crafting`；
-- 仓库里已经有 `.gitignore`（忽略 `__pycache__`、`tests/_*.txt`、`dist/`、`*.zip` 等）和
-  `.github/workflows/tests.yml`（push / PR 自动跑 `tests/run_tests.py` + `tests/check_encoding.py`）；
+- 仓库里已经有 `.gitignore`（忽略 `prompts/`、`tests/`、`.github/`、`__pycache__`、`dist/`、`*.zip` 等）——
+  公开仓库只含核心代码（§6），开发用的交接文档 / 离线测试 / CI 工作流都留在本地；
 - **许可证**：不写 `LICENSE` 等于"保留所有权利"，别人不能合法复用代码。要在 GitHub 上被放心使用，推荐加一份
   MIT（宽松、模组常见）或 GPL-3.0；需要的话告诉我，我把 `LICENSE` 与 README 的许可声明一起补上。
 
