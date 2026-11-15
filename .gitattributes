@@ -1,0 +1,9 @@
+# 统一行尾处理：仓库内按 LF 存储，Windows 检出时按 core.autocrlf 变回 CRLF
+* text=auto
+
+*.lua   text
+*.py    text
+*.md    text
+*.xml   text
+*.yml   text
+*.fnt   -text

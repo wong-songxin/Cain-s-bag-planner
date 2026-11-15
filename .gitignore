@@ -1,0 +1,35 @@
+# ------------------------------------------------------------
+# Cain's Bag Planner —— 上传 GitHub 时需要忽略的东西
+# ------------------------------------------------------------
+
+# 开发用文件（只留在本地，不进公开仓库）
+#   prompts/  开发交接文档（step1~5）
+#   tests/    离线测试（stub / 断言 / 模糊测试 / 穷举参考）
+#   .github/  CI 工作流（依赖 tests/，公开仓库不带测试时不适用）
+prompts/
+tests/
+.github/
+
+# Python（离线测试用）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 测试临时输出（手工重定向 stdout 时会产生 tests/_*.txt）
+tests/_*.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# 打包产物（发布用的 zip）
+dist/
+*.zip
+
+# 游戏日志（如果复制到仓库里调试）
+log.txt
