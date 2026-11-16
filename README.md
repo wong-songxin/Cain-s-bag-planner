@@ -34,18 +34,23 @@
 | 归属证据日志 `[CainsBag] attr ...` + 袋容量探针 `WARN` 自检 | ✅ 实机 | `bag_tracker.lua` |
 | **step5：出现过的配方去重 + 去掉 Tab 范围切换**（满 8 格出现过即拉黑，见 §9） | ✅ 离线 | `scripts/recipe.lua`、`chain.lua`、`bag_tracker.lua`、`main.lua`、`ui.lua` |
 | **bug 修复（step6）**：双素材掉落物按「一次拾取 = 一个动作」建模；已有另一个主动道具时合成主动也会清空 | ✅ 离线 | `chain.lua`、`ui.lua`、`bag_tracker.lua` |
+| **bug 修复（step7）**：控制台 `rewind` 后合成袋 / 本层掉落物信息按目标帧恢复（不再丢失）；普通拾取 vs 袋吸收改用「Q 是否举起 + 位置是否重叠」判定；**收集者名单收窄为官方 5 个 bum 跟班**（捐款机等 slot 不再误伤） | ✅ 离线（待实机复验） | `bag_tracker.lua`、`scan.lua`、`main.lua`、`config.lua` |
 | REPENTOGON 直读（可选、自动探测、异常回退事件模拟） | ⚠️ 代码就绪，本机未装未实测 | `bag_tracker.detectDirectRead / readDirectBag` |
-| 离线测试 | ✅ 267 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
+| 离线测试 | ✅ 301 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
 
 **待验证 / 待办（按优先级）**
 
 1. **REPENTOGON 直读**：装一次跑一局，确认 `bag source: direct read (REPENTOGON)` / `bag synced (direct): [...]`，并核对 0/1-based 与内容顺序；
 2. 合成自动清空的**实机复验**：合成后应出现 `craft detected` + `bag cleared: craft`，面板自动清空（见 §5 第 1 条）；
-3. 袋**未满**时 `ACTION_DROP` 的真实行为（轮转 / 无效 / 丢弃）——当前按"轮转"建模；
-4. `pickup.InitSeed` 跨房间唯一性（当前 key 优先用 seed，取不到退回 index）；
-5. 电池类（无计数器 / 无槽位信号）的归属边界：观察是否仍会多记一次；
-6. **偶发漏记（已知未修）**：连续快速吸取多个掉落物时，个别掉落物可能没被识别入袋
-   （挥袋动画同帧重叠 + 归属证据缺失）。当前用 `F9` 手工补正；后续排查可对比 `attr` 与 `skip collect` 日志的时间戳。
+3. **控制台 `rewind` 实机复验**：回退后日志应出现 `rewind detected (...) -> rewind applied (bagRestored=true rooms=N)`
+   与 `rewind: bag restored at frame=...`，面板不再变成「未知」；若 `bagRestored=false` 说明回退超过了
+   `config.RewindFrames`（默认 3 分钟）或本次运行没留下快照（此时仍需 `F9` 校正）；
+4. 袋**未满**时 `ACTION_DROP` 的真实行为（轮转 / 无效 / 丢弃）——当前按"轮转"建模；
+5. `pickup.InitSeed` 跨房间唯一性（当前 key 优先用 seed，取不到退回 index）；
+6. 电池类（无计数器 / 无槽位信号）的归属边界：观察是否仍会多记一次；
+7. **偶发漏记（已知未修）**：连续快速吸取多个掉落物时，个别掉落物可能没被识别入袋
+   （挥袋动画同帧重叠 + 归属证据缺失）。当前用 `F9` 手工补正；后续排查可对比 `attr` 与 `skip collect` 日志的时间戳，
+   以及 §8 新增的 `scan vanished` / `room-entry pending` 诊断行（收集者误伤已在 0.9.0 收窄为官方 5 个 bum 跟班）；
 
 ## 1. 安装
 
@@ -179,9 +184,15 @@ REPENTOGON 可用？
 | `MaxVisibleRows` | `12` | 链条最多显示行数 |
 | `CraftFallbackHold` | `true` | **合成后自动清空袋模拟**（不用再按 F6）：① 道具数增加（合成出被动道具）② 袋子被合成出的主动道具顶掉 ③ 已有另一个主动道具时主动槽 itemID 变化（`craft-active`）——任一命中即判定合成完成；另在长按合成键 20 帧时打一条 `long hold: anim=.. bag=n/8` 调试日志 |
 | `DirectRead` | `true` | 检测到 REPENTOGON 时逐帧直接读取真实袋内容；不可用时自动退回事件模拟 |
-| `CollectorRadius` | `40` | 事件模拟时，判定「掉落物被使魔 / 乞丐 / 老虎机拿走」的半径（无碰撞回调时的防御判断） |
+| `CollectorSkip` | `true` | 收集者启发式总开关：`false` 时完全不使用「附近有收集者 ⇒ 不计入」 |
+| `CollectorRadius` | `28` | 收集者判定半径（内部坐标）：只有官方 5 个 bum 跟班会贴到掉落物上吃它 |
+| `ExtraCollectorFamiliars` | `{}` | mod 跟班白名单：`{ [variant] = true }` 或 `{ [variant] = "名字" }`（官方之外会吃掉落物的跟班） |
 | `Attribution` | `"collision"` | 归属判定：`"collision"` = 新语义（碰撞=普通拾取→不计入；无碰撞的 Collect=袋吸收→计入）；`"legacy"` = 旧行为（玩家碰过就计入），仅对比/回退用 |
 | `TouchFreshFrames` | `3` | 碰撞记录的「新鲜」帧数：超出后视为旧触碰（碰过但没拿走），不再阻止入袋 |
+| `LateTouchFrames` | `8` | 碰撞证据迟到回滚窗口：`Collect` 之后这么多帧内收到碰撞记录 ⇒ 撤销刚才的入袋 |
+| `BagSwipeFrames` | `30` | **「举起合成袋（Q）」窗口**：按住期间每帧刷新，松手后再宽限这么多帧都算「袋吸收」；窗口外 + 与玩家重叠 ⇒ 普通拾取 |
+| `PickupOverlapDistance` | `26` | 「与玩家重叠」的距离阈值（≈玩家 + 掉落物碰撞半径之和；实测普通拾取 ≤23、袋吸收 ≥30） |
+| `RewindFrames` | `10800` | 控制台 `rewind` 的历史保留窗口（帧，60fps ≈ 3 分钟）；0 = 关闭（回退后按未知处理） |
 | `CounterVeto` | `true` | 计数器/槽位否决：钱 / 钥匙 / 炸弹 / 红心变多，或卡牌 / 药丸槽变化 ⇒ 这次是普通拾取 ⇒ 撤销刚才的入袋（回滚并重算） |
 | `CounterVetoFrames` | `20` | 否决观察窗口（帧）：拾取结算可能晚于 `Collect` 动画，别设太小 |
 | `ChargeProbe` | `true` | 袋容量探针：只读 `GetActiveCharge()/GetActiveMaxCharge()`。**不参与判定**，只在「跳过之后袋容量反而涨了」时打 `WARN`（说明归属判定可能反了） |
@@ -203,8 +214,17 @@ REPENTOGON 可用？
      - 碰撞记录只在 `TouchFreshFrames`（默认 3 帧）内有效：玩家碰过但没拿走（满血红心、卡槽满的卡牌等）
        随后被袋子吸收，仍会正确计入；其它玩家（2P）/ 使魔 / Bumbino / Ultra Greed 碰到 → 不计入；
        没有合成袋的玩家 → 一律不计入（`no-bag`）。
-     - 无碰撞、但附近有比玩家更近的使魔 / 乞丐 / 老虎机（`CollectorRadius`）→ 判为 `collector-near` 跳过
-       （防御：个别使魔可能不触发碰撞回调）。
+     - **收集者名单（官方口径）**：只有 `3.24.0 Bum Friend`、`3.64.0 Dark Bum`、`3.88.0 Bumbo`、
+       `3.90.0 Key Bum`、`3.102.0 Super Bum` 会吃掉场上的掉落物；其余实体（捐款机 / 血捐机 / 老虎机 / 重铸机等所有
+       `ENTITY_SLOT`、Bumbino、Ultra Greed）都**不算收集者**，否则它们旁边的掉落物被袋子吸走时会被误跳过
+       （`reason=collector-near`）。判定半径 `CollectorRadius`（默认 28，跟班要贴到掉落物上）+
+       比玩家更近才算收集者；`CollectorSkip=false` 可整体关闭该启发式，`ExtraCollectorFamiliars` 可登记 mod 跟班。
+     - **「是否举起袋子」是主判据（bug4）**：袋子只有按下 **Q**（`ACTION_PILLCARD`，与长按合成同一个键）
+       时才会吸取掉落物。`BagSwipeFrames`（默认 30 帧，按住时每帧刷新）窗口内 → 袋吸收；
+       窗口外 + 与玩家位置重叠（`PickupOverlapDistance`，默认 26）→ **走上去的普通拾取**
+       （`reason=player-pickup-near`），与掉落物类型无关（红心 / 魂心 / 黑心 / 电池 / 卡牌… 都不再误记）。
+     - **碰撞证据迟到（`LateTouchFrames`）**：`MC_POST_PICKUP_UPDATE` 通常早于碰撞结算；
+       碰撞记录随后才到时会按「先记后撤」撤销那次入袋（日志 `late touch: bag entry reverted ...`）。
      - **计数器 / 槽位否决（`CounterVeto`）**：钱 / 钥匙 / 炸弹 / 纯红心变多，或卡牌 / 药丸槽签名变化 ⇒
        这次确实是普通拾取 ⇒ 撤销刚才乐观写入的素材并重算（日志 `skip collect ... reason=counter|card`、
        `bag reverted after counter veto: [...]`；没被撤销的会打 `veto passed ...`）。
@@ -309,7 +329,7 @@ python tests/check_encoding.py  # UTF-8 无 BOM / 行尾检查
 python tests/run_one.py tests.perf   # 最坏情况性能参考
 ```
 
-当前结果：`run_tests.py` → **267 条断言全绿（0 失败）**；`check_encoding.py` → 28 个文件无问题。
+当前结果：`run_tests.py` → **301 条断言全绿（0 失败）**；`check_encoding.py` → 29 个文件无问题。
 
 > GitHub Actions 工作流（`.github/workflows/tests.yml`，Windows + Python 3.11/3.12）在本地保留，
 > 与 `tests/` 一样不随公开仓库上传；要启用 CI 就把 `.gitignore` 里的 `tests/`、`.github/` 去掉再提交。
@@ -318,8 +338,11 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 
 - 掉落物/卡牌/药丸 → 素材映射（含双素材掉落物、符文/药丸兜底）
 - 袋模拟的 FIFO、轮转、双素材一次顶 2 格、合成清空
-- 逐帧入袋识别（step4 归属语义）：袋吸收计入 / 玩家本人碰到不计入 / 其它玩家不计入 / 使魔不计入 / 收集者更近不计入 /
+- 逐帧入袋识别（step4 归属语义）：袋吸收计入 / 玩家本人碰到不计入 / 其它玩家不计入 / 收集者更近不计入 /
   无袋玩家不计入 / 旧触碰不阻止入袋 / 商店跳过 / `InitSeed` 去重 / 换房保护帧 / 计数器否决与回滚 / `legacy` 模式（M1）
+- 收集者口径（官方）：只有 3.24.0 / 3.64.0 / 3.88.0 / 3.90.0 / 3.102.0 这 5 个跟班会吃掉落物 →
+  捐款机（6.8.0）等 slot 旁边的掉落物仍计入；非 bum 跟班 / 距离过远 / `CollectorSkip=false` 都不跳过；
+  `ExtraCollectorFamiliars` 可登记 mod 跟班
 - 归属证据日志（`attr` 单行）与袋容量探针的 `WARN` 自检（测试里临时替换 `Log.Write` 捕获断言）
 - 合成自动清空：道具数增加 / 袋子被合成出的主动道具顶掉 → 清空；道具数不变 → 不清理
 - 合成主动道具（bug2）：已有另一个主动槽时替换该槽（道具总数不变、袋子还在）→ 按主动槽 itemID 变化
@@ -337,6 +360,11 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
   `distinct` 不增加；浪费剪枝与末尾裁剪；空配方史时结果与改动前完全一致；
   F9 校正 / 合成清空 / `use-item` 都会记录且幂等、`Reset` 清空、按 `Tab` 不改变任何状态
 - 加载 `main.lua` 后连续 400 帧 update + render 的集成冒烟测试
+- 普通拾取 vs 袋吸收（bug4）：没举起袋子（Q）时，与玩家重叠的 Collect 按普通拾取跳过
+  （魂心 / 黑心 / 电池 / 卡牌… 都覆盖，不再依赖计数器）；举起袋子时近处 Collect 仍计入；
+  松开 Q 超过 `BagSwipeFrames` 后回到普通拾取；碰撞证据晚于 Collect 首帧到达时撤销那次入袋
+- 控制台 `rewind`（bug1 / bug2）：袋内容按目标帧恢复（帧号索引快照）、没有快照时降级为 unknown；
+  本层掉落物只恢复「目标帧之前探索过的房间」；集成测试里模拟帧号倒退 + `continued=true` 回调
 - 字体探测：模拟 1.9 的「`Font(path)` 返回空字体」「`DrawStringUTF8` 第 5 参是框宽」两处坑，
   校验代码只接受真正加载出字形的字体、优先用 `DrawStringScaledUTF8`，并检查实机 512×288 坐标系下
   面板不越界、行高不小于字高（不会叠字）、不压住左上角道具槽，以及面板隐藏时不绘制
@@ -347,9 +375,9 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 | --- | --- |
 | `bag source: direct read (REPENTOGON)` / `bag source: event simulation (vanilla API)` | 当前袋内容来源（装没装 REPENTOGON） |
 | `bag state: known -> tracking (collect)` | 可信度流转（`unknown/known/tracking/uncertain`） |
-| `attr seed=.. index=.. ids=.. touch=.. verdict=.. reason=..` | **每条拾取的归属证据**（一次一条）。`touch` 看是谁碰的，`verdict=confirm/skip` + `reason` 看结论；带 `counters=` 与 `bag=n/8` 便于对照游戏内 HUD |
+| `attr seed=.. index=.. ids=.. touch=.. verdict=.. reason=..` | **每条拾取的归属证据**（一次一条）。`touch` 看是谁碰的，`verdict=confirm/skip` + `reason` 看结论；带 `counters=` 与 `bag=n/8` 便于对照游戏内 HUD；`nearest/nearestType/nearestVar/nearestIdx` 是最近的收集者（只有官方 5 个 bum 跟班会出现在这里） |
 | `collect seed=.. ids=.. src=player reason=bag-swipe` | 计入袋内（`bag-swipe` = 挥袋/吸取吸收） |
-| `skip collect ... reason=player-pickup|other-player|not-player|collector-near|shop|no-bag` | 未计入及原因 |
+| `skip collect ... reason=player-pickup|player-pickup-near|other-player|not-player|collector-near|shop|no-bag` | 未计入及原因（`player-pickup-near` = 没举起袋子时走上去捡的，bug4） |
 | `veto passed ... now=coin=X before=coin=X` | 20 帧内没看到"普通拾取"的迹象 → 认定已入袋 |
 | `skip collect ... reason=counter 普通拾取：coin=0 -> coin=1` + `bag reverted after counter veto: [...]` | 计数器否决：先记后撤（这次其实是普通拾取） |
 | `skip collect ... reason=card 卡牌/药丸槽变化：...` | 卡牌/药丸进了背包而不是袋子 |
@@ -363,6 +391,12 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 | `long hold: anim=<动画名> bag=n/8` | 长按合成键 20 帧的调试打点（仅记录，判定不依赖它） |
 | `WARN: bag charge rose after skip (reason=...)` | 袋容量探针自检：被判成普通拾取后容量反而上涨 ⇒ 归属语义可能反了，可用 `config.Attribution = "legacy"` 对比 |
 | `bag rotated: ...` / `drop pressed but bag is empty` | 丢弃键轮转（一次按键只转一格） |
+| `collide seed=.. index=.. colliderType=.. colliderIndex=.. bagPlayer=..` | 碰撞回调证据（每个掉落物一条）：核对碰撞回调是否触发、是否晚于 Collect 首帧 |
+| `late touch: bag entry reverted seed=.. ids=.. reason=player-pickup-late` | 碰撞记录晚于 Collect 首帧到达 ⇒ 撤销刚写入的袋内容（先记后撤） |
+| `rewind detected (source) / rewind applied (source=.. frame=.. bagRestored=.. rooms=N)` | 控制台 `rewind`：检测到同一局帧号倒退 + 恢复结果（袋 / 本层房间数） |
+| `rewind: bag restored at frame=F (snapshot frame=S) -> [..]` | 袋内容已恢复到目标帧 F 的状态（快照帧 S）；没有这行说明没有可用快照 |
+| `scan vanished: seed=.. idx=.. dist=.. swipe=0/1 nearest=..` | 两帧扫描之间消失、且从未见过 `Collect` 的掉落物（当前只记录、不判定）：用于排查「一次吸多个偶发漏 1 个」 |
+| `room-entry pending: seed=.. idx=.. dist=.. swipe=0/1 src=..` | 换房保护帧内被吸收的掉落物（当前不判定）：同上，用于量化漏记 |
 | `font ok/skip`、`UI init:`、`render geom:` | 字体与渲染探测（见 §5 第 2 条） |
 | `chain: distinct=.. crafted=.. windows=.. steps=.. waste=.. ms=..` | 链搜索结果与耗时（`SearchBudgetMs` 超出会分帧续算）；`crafted` = 本次链条命中「已出现过配方」的次数 |
 
@@ -385,8 +419,25 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
   走上去捡属于普通拾取，且 `MC_PRE_PICKUP_COLLISION` 对 T.Cain **不触发**。因此实现为：
   「有新鲜碰撞 = 普通拾取 → 不计入；无碰撞的 `Collect` = 袋吸收 → 计入」，再用「计数器 / 卡牌槽否决」兜住无信号的漏判；
   `config.Attribution = "legacy"` 可切回旧行为做对照。
+  - **补充（step7）**：实测日志表明「碰撞回调不触发」更可能是**顺序问题**——`MC_POST_PICKUP_UPDATE`（抓 `Collect` 首帧）
+    通常早于碰撞结算，模组先乐观入袋、碰撞记录随后才到，于是所有 `attr` 都显示 `touch=none`。现在碰撞记录到达时
+    会按「先记后撤」撤销那次入袋（`LateTouchFrames`，与计数器否决同口径），减少对计数器的依赖。
+  - **补充（step7，bug4）**：实测「红心 / 炸弹 / 钥匙 / 金币」因为计数器否决能正确回滚，其余类型（魂心、黑心、电池、卡牌…）
+    走上去捡时没有可用信号 ⇒ 一律被误记。现在改用**「Q 是否举起」**作为主判据：`ACTION_PILLCARD`（与长按合成同一个键）
+    按下后 `BagSwipeFrames` 帧内算“袋吸收窗口”；窗口外 + 与玩家位置重叠（≤ `PickupOverlapDistance`，默认 26）⇒ 普通拾取。
+    依据实测日志：普通拾取 `playerDist ≤ 23`、袋吸收 `≥ 30`。
+  - **补充（0.9.0，收集者口径）**：原实现把所有 `ENTITY_SLOT` 都当收集者，导致**捐款机旁边的掉落物**被袋子吸走时
+    被判成 `collector-near` 而漏记。按官方数据收窄为 5 个跟班：`3.24.0 Bum Friend`、`3.64.0 Dark Bum`、
+    `3.88.0 Bumbo`、`3.90.0 Key Bum`、`3.102.0 Super Bum`（`scan.lua` 按 `entity.Variant` 过滤）；
+    捐款机 / 血捐机 / 老虎机 / 重铸机等 slot、Bumbino、Ultra Greed 一律不算收集者；
+    半径同时从 40 收紧到 `CollectorRadius = 28`（跟班要贴到掉落物上才会吃）。
 - **合成清空**不再依赖动画名（`PickupWalk`）与松手时序，改为「道具数 +1」或「袋子被合成出的主动道具顶掉」判定（见 §5 第 1 条），
   失败一次也不会让面板一直记着旧的 8 格。
+- **控制台 `rewind`（step7）**：Repentance+ 的 `rewind` 会以同一 `start seed` 重新播放入口回调
+  （`POST_PLAYER_INIT` / `POST_GAME_STARTED(continued=true)` / 有时还有 `POST_NEW_LEVEL`），原来的实现会把这些当成
+  「续档」整体清空 ⇒ 面板上的袋内容与本层掉落物全丢。现在按 `Game():GetFrameCount()` 记录袋内容与本层房间扫描快照，
+  检测到同一局帧号倒退后恢复到目标帧（`config.RewindFrames` 控制保留窗口，默认 3 分钟）；没有快照时降级为 `unknown`（提示 F9）。
+  换层不再整体清空 `Scan`，而是按楼层标识过滤。
 
 ## 10. 发布 / 上传
 
@@ -437,4 +488,4 @@ dist\CainsBag.zip            ← 解压后得到 mods\CainsBag\...
 - 游戏内 `Mods` → 选中本模组 → `Upload`，游戏会读取 `metadata.xml`；
 - 上传前把 `<visibility>` 从 `Private` 改成 `Public`（**只影响工坊可见性，不影响 GitHub**）；
 - `<id>` 目前是占位值，只在工坊上传流程里才需要唯一 id，纯 GitHub 分发可以不管；
-- 每次发版同步改 `metadata.xml` 的 `<version>`（当前 `0.7.0`），工坊端才能正确提示更新。
+- 每次发版同步改 `metadata.xml` 的 `<version>`（当前 `0.9.0`），工坊端才能正确提示更新。

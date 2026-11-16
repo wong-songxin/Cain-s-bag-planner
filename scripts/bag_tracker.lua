@@ -70,7 +70,23 @@ local playerX = nil
 local playerY = nil
 local bagPlayer = nil          -- 当前追踪的玩家（计数器二次确认要用）
 local ignoreTicks = 0         -- 换房后的保护帧：掉落物 Index 可能残留
+local swipeUntil = -1000      -- “举起合成袋（Q）”窗口：到这一刻之前都算袋吸收（bug4）
+local pushedInfo = {}         -- key -> { entry, evicted, recipeKey, frame, reason }（碰撞证据迟到时撤销）
+local collideLogged = {}      -- key -> true，每个掉落物只打一条碰撞证据日志
+local vanishedLogged = {}     -- key -> true，“两帧扫描之间消失且从未见过 Collect”的诊断（只记录，不判定）
+local roomEntryLogged = {}    -- key -> true，换房保护帧内被吸收的掉落物诊断（当前不判定）
 local editorRef = nil         -- scripts.bag_editor 注册进来，供 GetEditState() 只读查询
+
+-- ------------------------------------------------------------
+-- 回退（控制台 rewind / 时间回溯）恢复
+-- rewind 会把整局状态倒回到若干帧前（start seed 不变、帧号变小），并向模组重新发
+-- POST_PLAYER_INIT / POST_GAME_STARTED(continued=true)。如果照常 Reset()，面板上的
+-- 袋内容与本层掉落物就全丢了。这里按「游戏帧号」保留最近一段快照，回退后恢复到
+-- 目标帧的状态（袋吸收是确定性的：同一帧在两条时间线上袋内容相同）。
+-- ------------------------------------------------------------
+local gameFrame = 0           -- Game():GetFrameCount()（整局帧号，不会因换房归零）
+local bagHistory = {}         -- { { frame = n, slots = {...} }, ... }（帧号递增）
+local rewindCount = 0         -- 已恢复的回退次数（日志 / 测试用）
 
 -- 单调帧计时：Room:GetFrameCount() 换房会归零，会把“之前的快照”变成“未来时间”，
 -- 导致计数器否决永远取不到正确的前置值（这是金币被误记的根因之一）
@@ -107,6 +123,79 @@ local COUNTER_HISTORY_MAX = 12
 
 local function nowFrame()
     return tick
+end
+
+-- 整局帧号（换房不归零）；1.9 原生 API 就有，取不到时返回 nil（回退到 tick）
+local function readGameFrame()
+    local value = nil
+    pcall(function()
+        value = Game():GetFrameCount()
+    end)
+    if type(value) == "number" then
+        return value
+    end
+    return nil
+end
+
+local function copyList(list)
+    local copy = {}
+    for i = 1, #list do
+        copy[i] = list[i]
+    end
+    return copy
+end
+
+-- 历史保留窗口（帧）；config.RewindFrames = 0 表示不保留（回退后只能按未知处理）
+local function historyWindow()
+    local value = config.RewindFrames
+    if type(value) ~= "number" then
+        return 10800
+    end
+    return value
+end
+
+-- 袋内容快照：只在袋发生变化时调用（入袋 / 清空 / 校正 / 撤销）
+-- 同一帧内多次变化只保留最后一次；超出窗口的旧快照会被裁掉
+local function noteBagSnapshot()
+    if historyWindow() <= 0 then
+        return
+    end
+    local frame = readGameFrame()
+    if frame == nil then
+        frame = gameFrame
+    end
+    local last = bagHistory[#bagHistory]
+    local snapshot = copyList(slots)
+    if last ~= nil and last.frame == frame then
+        last.slots = snapshot
+    else
+        bagHistory[#bagHistory + 1] = { frame = frame, slots = snapshot }
+    end
+    local cutoff = frame - historyWindow()
+    local keepFrom = nil
+    for i = 1, #bagHistory do
+        if bagHistory[i].frame >= cutoff then
+            keepFrom = i
+            break
+        end
+    end
+    if keepFrom ~= nil and keepFrom > 1 then
+        for i = keepFrom - 1, 1, -1 do
+            table.remove(bagHistory, i)
+        end
+    end
+end
+
+-- 目标帧（含）之前最近的袋快照；目标帧早于所有记录时返回 nil（不知道就按未知处理）
+-- 帧号 ≤ 0 的快照是“刚开局的基线”，不能代表真值（回退到 0 时一律按未知处理）
+local function findBagSnapshot(frame)
+    for i = #bagHistory, 1, -1 do
+        local snapshot = bagHistory[i]
+        if snapshot.frame <= frame and snapshot.frame > 0 then
+            return snapshot
+        end
+    end
+    return nil
 end
 
 local function entityField(entity, field)
@@ -260,43 +349,45 @@ local function nearestCollector(entry)
     return best, bestDist
 end
 
--- 收集者类型标签（日志用）
+-- 收集者类型标签（日志用）：只有官方 5 个吃掉落物的跟班会出现在这里
 local function collectorLabel(collector)
     if collector == nil then
         return "-"
     end
     local entityType = collector.type
     if entityType == EntityType.ENTITY_FAMILIAR then
+        if collector.name ~= nil then
+            return "familiar:" .. tostring(collector.variant or "?") .. "(" .. tostring(collector.name) .. ")"
+        end
         return "familiar"
-    end
-    if entityType == EntityType.ENTITY_SLOT then
-        return "slot"
-    end
-    if EntityType.ENTITY_BUMBINO ~= nil and entityType == EntityType.ENTITY_BUMBINO then
-        return "bumbino"
-    end
-    if EntityType.ENTITY_ULTRA_GREED ~= nil and entityType == EntityType.ENTITY_ULTRA_GREED then
-        return "greed"
     end
     return tostring(entityType or "?")
 end
 
 local function collectorNear(entry)
+    if config.CollectorSkip == false then
+        return false
+    end
     local _, dist = nearestCollector(entry)
     if dist == nil then
         return false
     end
-    local radius = config.CollectorRadius or 40
+    local radius = config.CollectorRadius or 28
     return dist <= radius * radius
 end
 
 -- 收集者比持袋玩家更靠近这个掉落物？（用于“没有碰撞回调”时的防御性判断）
+-- 口径：官方只有 Bum Friend / Dark Bum / Bumbo / Key Bum / Super Bum 会吃地上掉落物，
+-- 其它实体（捐款机等 slot、Bumbino、Ultra Greed）都不算收集者（scan.lua 负责过滤）。
 local function collectorCloserThanPlayer(entry)
+    if config.CollectorSkip == false then
+        return nil
+    end
     local collector, dist = nearestCollector(entry)
     if collector == nil then
         return nil
     end
-    local radius = config.CollectorRadius or 40
+    local radius = config.CollectorRadius or 28
     if dist > radius * radius then
         return nil
     end
@@ -652,7 +743,7 @@ local function noteChargeWatch(key, reason)
         return
     end
     if reason ~= "player-pickup" and reason ~= "other-player" and reason ~= "not-player"
-        and reason ~= "collector-near" then
+        and reason ~= "collector-near" and reason ~= "player-pickup-near" then
         return
     end
     chargeWatch = { charge = lastCharge, frame = nowFrame(), reason = reason, key = key }
@@ -693,6 +784,55 @@ local function playerDistance(entry)
     local dx = entry.x - playerX
     local dy = entry.y - playerY
     return math.sqrt(dx * dx + dy * dy)
+end
+
+-- ------------------------------------------------------------
+-- 普通拾取 vs 袋吸收（bug4）
+-- 事实：袋子只有「举起 / 使用」时才会吸取掉落物（Q = ACTION_PILLCARD，与长按合成同一个键）。
+-- 而 MC_PRE_PICKUP_COLLISION 在堕化该隐身上基本拿不到有效记录，于是：
+--   · 举起袋子（BagSwipeFrames 窗口内）→ 一律按袋吸收
+--   · 没举起袋子 + 与玩家位置重叠（≤ PickupOverlapDistance）→ 走上去的普通拾取（任何类型）
+-- 依据实测日志：普通拾取 playerDist ≤ 23，袋吸收 ≥ 30（挥袋半径明显更大）。
+-- ------------------------------------------------------------
+local function overlapDistance()
+    local value = config.PickupOverlapDistance
+    if type(value) == "number" and value > 0 then
+        return value
+    end
+    return 26
+end
+
+local function bagSwipeFrames()
+    local value = config.BagSwipeFrames
+    if type(value) == "number" and value > 0 then
+        return value
+    end
+    return 40
+end
+
+-- 袋子此刻是否处于“举起/吸取”状态（最近 BagSwipeFrames 帧内按过 Q）
+local function bagInUse()
+    return tick <= swipeUntil
+end
+
+-- 记一次“举起袋子”（由 Update 每帧读取输入）
+local function noteBagUse()
+    swipeUntil = tick + bagSwipeFrames()
+end
+
+-- 读一次“举起袋子”的输入；Update 与每次判定前都同步一次，
+-- 避免 MC_POST_PICKUP_UPDATE 早于 POST_UPDATE 造成的 1 帧误差
+local function syncBagUse()
+    if bagPlayerIndex == nil then
+        return
+    end
+    local held = false
+    pcall(function()
+        held = Input.IsActionPressed(ButtonAction.ACTION_PILLCARD, bagPlayerIndex) == true
+    end)
+    if held then
+        noteBagUse()
+    end
 end
 
 -- 计数器快照文本（写进 attr 日志，便于对照“钱到底涨没涨”）
@@ -737,6 +877,8 @@ local function logAttr(key, entry, verdict, reason, touch, age)
         "playerNear=" .. tostring(isNearPlayer(entry)),
         "nearest=" .. (collectorDist ~= nil and tostring(math.floor(math.sqrt(collectorDist) + 0.5)) or "-"),
         "nearestType=" .. collectorLabel(nearest),
+        "nearestVar=" .. tostring(nearest ~= nil and nearest.variant or "-"),
+        "nearestIdx=" .. tostring(nearest ~= nil and nearest.index or "-"),
         "charge=" .. ((charge ~= nil) and (tostring(charge) .. "/" .. tostring(maxCharge or "?")) or "-"),
         "counters=" .. counterText(bagPlayer),
         "bag=" .. tostring(#slots) .. "/" .. tostring(BAG_SIZE),
@@ -914,7 +1056,9 @@ local function updateCounterVeto(player)
             revertPush(pending)
             releaseRecipe(pending.recipeKey)   -- 这次拾取并没有进袋 ⇒ 撤销刚登记的配方
             pushed[key] = nil
+            pushedInfo[key] = nil
             skipLog[key] = cardChanged and "card" or "counter"
+            noteBagSnapshot()
             local detail = ""
             if cardChanged then
                 detail = " 卡牌/药丸槽变化：" .. tostring(pending.cardBefore) .. " -> " .. tostring(cardSignature)
@@ -967,6 +1111,7 @@ local function pushPickup(entry)
     if confidence == "known" then
         setConfidence("tracking", "collect")
     end
+    noteBagSnapshot()
     return evicted, recipeKey
 end
 
@@ -998,6 +1143,13 @@ local function confirmCollect(key, entry, reason, touch, age)
             .. " src=player reason=" .. tostring(reason))
     end
     local evicted, recipeKey = pushPickup(entry)
+    pushedInfo[key] = {
+        entry = entry,
+        evicted = evicted or {},
+        recipeKey = recipeKey,
+        frame = nowFrame(),
+        reason = reason,
+    }
     scheduleCounterCheck(bagPlayer, entry.ids)
     scheduleCounterVeto(key, entry, evicted, bagPlayer, recipeKey)
 end
@@ -1073,6 +1225,15 @@ local function attributePickup(entry)
     if collectorCloserThanPlayer(entry) ~= nil then
         return "skip", "collector-near", nil, nil
     end
+    -- 没有碰撞记录时的兜底（bug4）：
+    -- 袋子只有“举起（Q）”时才会吸取 ⇒ 没举起 + 位置与玩家重叠 = 走上去的普通拾取。
+    -- 与掉落物类型无关，因此魂心/黑心/电池/卡牌…都不再误记（也不再依赖计数器）。
+    if not bagInUse() then
+        local dist = playerDistance(entry)
+        if dist ~= nil and dist <= overlapDistance() then
+            return "skip", "player-pickup-near", nil, nil
+        end
+    end
     return "confirm", "bag-swipe", nil, nil
 end
 
@@ -1084,6 +1245,7 @@ local function resolvePickup(key, entry, source)
         end
         return
     end
+    syncBagUse()   -- 判定前再读一次输入（回调顺序可能早于 POST_UPDATE）
     local verdict, reason, touch, age = attributePickup(entry)
     if verdict == "confirm" then
         confirmCollect(key, entry, reason or source, touch, age)
@@ -1137,6 +1299,7 @@ function BagTracker.Rotate()
     end
     local first = table.remove(slots, 1)
     slots[#slots + 1] = first
+    noteBagSnapshot()   -- 顺序变了，rewind 恢复也要跟着变
 end
 
 -- 合成清空 / 手动校准
@@ -1154,8 +1317,10 @@ function BagTracker.Clear(reason)
     pendingChecks = {}
     pendingVeto = {}
     counterHistory = {}
+    pushedInfo = {}
     lastClearReason = label
     setConfidence("known", "clear:" .. lastClearReason)
+    noteBagSnapshot()
     if config.Debug then
         Log.Write("[CainsBag] bag cleared: " .. lastClearReason)
     end
@@ -1211,6 +1376,15 @@ function BagTracker.Reset(reason)
     playerY = nil
     bagPlayer = nil
     ignoreTicks = 0
+    swipeUntil = -1000
+    pushedInfo = {}
+    collideLogged = {}
+    vanishedLogged = {}
+    roomEntryLogged = {}
+    -- 新的一局：帧号从头开始，旧的历史快照不能再用来恢复
+    bagHistory = {}
+    gameFrame = 0
+    noteBagSnapshot()
 end
 
 -- 手动校准（F6）：清空模拟并标记已对齐
@@ -1220,6 +1394,7 @@ function BagTracker.Calibrate()
     pendingVeto = {}
     craftHoldFrames = 0
     setConfidence("known", "manual-empty")
+    noteBagSnapshot()
     Log.Write("[CainsBag] bag calibrated (empty)")
 end
 
@@ -1239,6 +1414,74 @@ function BagTracker.OnGameStarted(isContinued)
     else
         BagTracker.Calibrate()
     end
+end
+
+-- ------------------------------------------------------------
+-- 回退（控制台 rewind / 时间回溯）恢复：main.lua 检测到同一局帧号倒退时调用
+-- 把袋恢复到目标帧的状态，并清掉逐帧缓存（目标帧之后被吸收的掉落物已经回到地上）
+-- 说明：配方史（已出现 / 已合成）不回退——它只影响推荐，不会因为回退而“多推荐”错配方
+-- 返回 true = 成功恢复；false = 没有可用快照（只能按未知处理）
+-- ------------------------------------------------------------
+function BagTracker.OnRewind(frame)
+    local target = frame
+    if type(target) ~= "number" then
+        target = readGameFrame()
+    end
+    if type(target) ~= "number" then
+        target = gameFrame
+    end
+    gameFrame = target
+    -- 目标帧之后的快照属于「被回退掉的时间线」，已失效（玩家可能换了操作）→ 裁掉
+    for i = #bagHistory, 1, -1 do
+        if bagHistory[i].frame > target then
+            table.remove(bagHistory, i)
+        end
+    end
+    local snapshot = findBagSnapshot(target)
+
+    known = {}
+    touched = {}
+    pushed = {}
+    skipLog = {}
+    attrLogged = {}
+    pushedInfo = {}
+    collideLogged = {}
+    vanishedLogged = {}
+    roomEntryLogged = {}
+    pendingVeto = {}
+    pendingChecks = {}
+    counterHistory = {}
+    chargeWatch = nil
+    lastCollectibleCount = nil
+    activeSnapshot = nil
+    craftHoldFrames = 0
+    ignoreTicks = 2
+
+    if snapshot == nil then
+        slots = {}
+        setConfidence("unknown", "rewind-no-history")
+        Log.Write("[CainsBag] rewind: no bag history at frame=" .. tostring(target)
+            .. ", bag becomes unknown")
+        return false
+    end
+
+    slots = copyList(snapshot.slots)
+    rewindCount = rewindCount + 1
+    setConfidence("known", "rewind")
+    noteBagSnapshot()
+    Log.Write("[CainsBag] rewind: bag restored at frame=" .. tostring(target)
+        .. " (snapshot frame=" .. tostring(snapshot.frame) .. ") -> " .. BagTracker.GetDebugText())
+    return true
+end
+
+-- 已恢复的回退次数（日志 / 离线测试用）
+function BagTracker.GetRewindCount()
+    return rewindCount
+end
+
+-- 当前整局帧号（测试 / 日志用）
+function BagTracker.GetGameFrame()
+    return readGameFrame() or gameFrame
 end
 
 function BagTracker.IsTracking()
@@ -1366,6 +1609,7 @@ function BagTracker.SetSlots(list)
         noteRecipeAppeared(slots, "edit")
     end
     setConfidence("known", "edit")
+    noteBagSnapshot()
     if config.Debug then
         Log.Write("[CainsBag] bag edited: " .. BagTracker.GetDebugText())
     end
@@ -1400,6 +1644,7 @@ function BagTracker.SetSlot(index, id)
         noteRecipeAppeared(slots, "edit")
     end
     setConfidence("known", "edit")
+    noteBagSnapshot()
     if config.Debug then
         Log.Write("[CainsBag] bag edited: " .. BagTracker.GetDebugText())
     end
@@ -1422,6 +1667,46 @@ end
 -- ------------------------------------------------------------
 -- 入袋检测（M1）
 -- ------------------------------------------------------------
+
+-- ------------------------------------------------------------
+-- 碰撞证据迟到（bug3）
+-- MC_POST_PICKUP_UPDATE（抓 Collect 首帧）通常早于碰撞结算 ⇒ “走上去捡”的掉落物
+-- 会先被乐观记入袋，MC_PRE_PICKUP_COLLISION 的碰撞记录随后才到。这里按「先记后撤」
+-- 撤销那次入袋（与计数器否决同口径），不再依赖钱/钥匙计数器兜底。
+-- ------------------------------------------------------------
+local function lateTouchFrames()
+    local value = config.LateTouchFrames
+    if type(value) == "number" and value > 0 then
+        return value
+    end
+    return 8
+end
+
+local function revertLateTouch(key)
+    local info = pushedInfo[key]
+    if info == nil or info.reason ~= "bag-swipe" then
+        return false
+    end
+    if info.entry == nil or info.entry.ids == nil then
+        return false
+    end
+    if nowFrame() - (info.frame or 0) > lateTouchFrames() + touchFreshFrames() then
+        return false
+    end
+    if not revertPush(info) then
+        return false
+    end
+    pushed[key] = nil
+    pushedInfo[key] = nil
+    pendingVeto[key] = nil
+    releaseRecipe(info.recipeKey)
+    skipLog[key] = "player-pickup-late"
+    noteBagSnapshot()
+    Log.Write("[CainsBag] late touch: bag entry reverted seed=" .. tostring(info.entry.seed or "-")
+        .. " index=" .. tostring(info.entry.index or "-")
+        .. " ids=" .. table.concat(info.entry.ids, ",") .. " reason=player-pickup-late")
+    return true
+end
 
 -- 由 MC_PRE_PICKUP_COLLISION 调用：记录“谁碰过这个掉落物”
 -- target 可以是 EntityPickup（新）或 Index 数字（兼容旧调用）
@@ -1468,6 +1753,23 @@ function BagTracker.MarkTouched(target, collider)
         colliderType = colliderType,
         colliderIndex = colliderIndex,
     }
+    -- 碰撞证据日志：用于核对“碰撞回调到底有没有触发 / 比 Collect 晚几帧”
+    if config.Debug and not collideLogged[key] then
+        collideLogged[key] = true
+        local seedText, indexText = "-", "-"
+        if type(target) == "table" then
+            seedText = tostring(target.seed or entityField(target, "InitSeed") or "-")
+            indexText = tostring(target.index or entityField(target, "Index") or "-")
+        else
+            indexText = tostring(target)
+        end
+        Log.Write("[CainsBag] collide seed=" .. seedText .. " index=" .. indexText
+            .. " colliderType=" .. tostring(colliderType or "-")
+            .. " colliderIndex=" .. tostring(colliderIndex or "-")
+            .. " bagPlayer=" .. tostring(isBagPlayer))
+    end
+    -- 碰撞记录晚于 Collect 首帧时，撤销刚才的乐观入袋（先记后撤）
+    revertLateTouch(key)
 end
 
 -- 语义更明确的新名字（main.lua 使用）
@@ -1475,9 +1777,25 @@ function BagTracker.NoteCollision(pickup, collider)
     BagTracker.MarkTouched(pickup, collider)
 end
 
+-- 换房保护帧内被吸收的掉落物：当前既不判定、也无法补判（known 已清空），
+-- 先打一条只读诊断，便于量化“偶发漏记”还剩多少（启用延迟判定前要有数据）
+local function logRoomEntryPending(key, entry, source)
+    if not config.Debug or key == nil or roomEntryLogged[key] then
+        return
+    end
+    roomEntryLogged[key] = true
+    local dist = playerDistance(entry)
+    Log.Write("[CainsBag] room-entry pending: seed=" .. tostring(entry.seed or "-")
+        .. " index=" .. tostring(entry.index or "-")
+        .. " ids=" .. ((entry.ids ~= nil) and table.concat(entry.ids, ",") or "-")
+        .. " dist=" .. (dist ~= nil and tostring(math.floor(dist + 0.5)) or "-")
+        .. " swipe=" .. (bagInUse() and "1" or "0")
+        .. " src=" .. tostring(source))
+end
+
 -- 由 MC_POST_PICKUP_UPDATE 调用（每个掉落物每帧）：逐帧抓 Collect 首帧
 function BagTracker.OnPickupUpdate(pickup)
-    if pickup == nil or ignoreTicks > 0 or directReadAvailable == true then
+    if pickup == nil or directReadAvailable == true then
         return
     end
     -- 先看动画（idle 掉落物占多数，避免每帧对每个掉落物取两次字段）
@@ -1492,7 +1810,12 @@ function BagTracker.OnPickupUpdate(pickup)
     if pushed[key] or skipLog[key] then
         return
     end
-
+    if ignoreTicks > 0 then
+        if config.Debug then
+            logRoomEntryPending(key, entryFromPickup(pickup), "anim")
+        end
+        return
+    end
     resolvePickup(key, entryFromPickup(pickup), "anim")
 end
 
@@ -1510,17 +1833,35 @@ function BagTracker.OnRoomScan(entries)
         local key = entryKey(entry)
         if key ~= nil then
             current[key] = entry
-            if not locked and entry.collecting and not pushed[key] and not skipLog[key] then
-                resolvePickup(key, entry, "scan")
+            if not pushed[key] and not skipLog[key] and entry.collecting then
+                if locked then
+                    logRoomEntryPending(key, entry, "scan")
+                else
+                    resolvePickup(key, entry, "scan")
+                end
             end
         end
     end
 
     -- 上一次还在、这次消失的掉落物：只有“消失前正在 Collect”才可能是入袋
     for key, prev in pairs(known) do
-        if current[key] == nil and not locked and not pushed[key] and not skipLog[key]
-            and prev.collecting then
-            resolvePickup(key, prev, "scan")
+        if current[key] == nil and not locked and not pushed[key] and not skipLog[key] then
+            if prev.collecting then
+                resolvePickup(key, prev, "scan")
+            elseif config.Debug and not vanishedLogged[key] then
+                -- 两帧扫描之间消失、且从未见过 Collect：当前不判定，只记录诊断
+                vanishedLogged[key] = true
+                local dist = playerDistance(prev)
+                local nearest, collectorDist = nearestCollector(prev)
+                Log.Write("[CainsBag] scan vanished: seed=" .. tostring(prev.seed or "-")
+                    .. " index=" .. tostring(prev.index or "-")
+                    .. " ids=" .. ((prev.ids ~= nil) and table.concat(prev.ids, ",") or "-")
+                    .. " dist=" .. (dist ~= nil and tostring(math.floor(dist + 0.5)) or "-")
+                    .. " swipe=" .. (bagInUse() and "1" or "0")
+                    .. " nearest=" .. (collectorDist ~= nil
+                        and tostring(math.floor(math.sqrt(collectorDist) + 0.5)) or "-")
+                    .. " nearestType=" .. collectorLabel(nearest))
+            end
         end
     end
 
@@ -1546,7 +1887,12 @@ function BagTracker.OnNewRoom()
     chargeWatch = nil
     collectors = {}
     directReadAvailable = nil
+    pushedInfo = {}
+    collideLogged = {}
+    vanishedLogged = {}
+    roomEntryLogged = {}
     ignoreTicks = 2   -- 换房后前 2 帧不判定（防止跨房残留）
+    -- 注意：不清空 swipeUntil（玩家可能正举着袋子走过门，进房瞬间继续吸取）
 end
 
 -- 合成检测：合成成功后自动清空袋模拟（省掉手按 F6）
@@ -1652,6 +1998,12 @@ end
 -- 每帧调用：更新角色状态、轮转、合成兜底、计数器二次确认
 function BagTracker.Update(player)
     tick = tick + 1
+    local frame = readGameFrame()
+    if frame ~= nil then
+        gameFrame = frame
+    else
+        gameFrame = gameFrame + 1
+    end
     if player == nil then
         return
     end
@@ -1664,6 +2016,8 @@ function BagTracker.Update(player)
         playerX = player.Position.X
         playerY = player.Position.Y
     end)
+    -- 举起合成袋（Q = ACTION_PILLCARD，与长按合成同一个键）→ 打开“袋吸收”窗口（bug4）
+    syncBagUse()
     local playerType = -1
     pcall(function()
         playerType = player:GetPlayerType()
@@ -1682,6 +2036,7 @@ function BagTracker.Update(player)
                 if #slots == BAG_SIZE then
                     noteRecipeAppeared(slots, "direct")
                 end
+                noteBagSnapshot()
                 if config.Debug then
                     Log.Write("[CainsBag] bag synced (direct): " .. BagTracker.GetDebugText())
                 end

@@ -51,9 +51,18 @@ local config = {
     -- 另在长按合成键 20 帧时打一条 `long hold: anim=.. bag=n/8` 调试日志（判定不依赖动画名）
     CraftFallbackHold = true,
 
+    -- 控制台 rewind / 时间回溯：按游戏帧号保留最近的袋内容与掉落物扫描快照，
+    -- 回退（同一局 + 帧号倒退）后恢复到目标帧的状态，而不是把面板信息清空。
+    RewindFrames = 10800,          -- 最多保留多少帧历史（60fps ≈ 3 分钟）；0 = 关闭（回退后按未知处理）
+
     -- 袋内容来源
     DirectRead = true,             -- 检测到 REPENTOGON 时直接读取袋内容（不可用时自动退回事件模拟）
-    CollectorRadius = 40,          -- 事件模拟时：判定“这个掉落物是被使魔/乞丐/商店机拿走的”的半径
+    -- 收集者（会吃掉场上掉落物的实体）启发式：
+    -- 官方只有 5 个跟班：3.24.0 Bum Friend / 3.64.0 Dark Bum / 3.88.0 Bumbo /
+    -- 3.90.0 Key Bum / 3.102.0 Super Bum；其它实体（含捐款机等 slot、Bumbino、Ultra Greed）都不吃掉落物。
+    CollectorSkip = true,          -- 总开关：false 时完全不使用“附近有收集者 ⇒ 不计入”的判定
+    CollectorRadius = 28,          -- 判定半径（内部坐标，1 格 = 40）：跟班要贴到掉落物上才会吃
+    ExtraCollectorFamiliars = {},  -- mod 跟班白名单：{ [variant] = true } 或 { [variant] = "名字" }
     CounterCheck = false,          -- 背包计数器二次确认（仅调试用；真实归属判定改用下面的 CounterVeto）
 
     -- 归属判定（step4）
@@ -63,6 +72,13 @@ local config = {
     -- "legacy"    = 旧行为（玩家触碰就计入；附近没有收集者也算玩家），仅用于对比/回退
     Attribution = "collision",
     TouchFreshFrames = 3,          -- 碰撞记录的“新鲜”帧数（普通拾取结算窗口，超出即视为旧触碰）
+    LateTouchFrames = 8,           -- 碰撞证据迟到：Collect 之后这么多帧内才收到碰撞 ⇒ 撤销刚才的入袋
+    -- 举起合成袋（Q = ACTION_PILLCARD）才会吸取掉落物：按下后这段时间内仍算“袋吸收窗口”
+    -- （按住期间每帧刷新；这里控制松手后还继续算吸取的宽限帧数）
+    BagSwipeFrames = 30,
+    -- 没举起袋子时：与玩家位置重叠的 Collect 一律按“走上去的普通拾取”处理（bug4）
+    -- 距离取两个碰撞半径之和 ≈ 26（内部坐标；实测普通拾取 ≤23、袋吸收 ≥30）
+    PickupOverlapDistance = 26,
     CounterVeto = true,            -- 计数器否决：钱/钥匙/炸弹/红心变多 ⇒ 说明这次是普通拾取 → 回滚入袋
     CounterVetoFrames = 20,        -- 计数器否决的观察窗口（帧）：拾取结算可能晚于 Collect 动画，别设太小
     ChargeProbe = true,            -- 袋容量探针：只读 GetActiveCharge()，用于自检“归属判定是否反了”（不改判定）

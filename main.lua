@@ -45,6 +45,10 @@ local state = {
     searching = false,
     progress = 0,
     editor = { active = false, cursor = 1, slots = {} },
+    -- rewind 恢复用：整局帧号 / start seed / 待恢复标记
+    gameFrame = nil,
+    runSeed = nil,
+    rewindPending = nil,
 }
 
 local function log(text)
@@ -408,6 +412,91 @@ local function handleHotkeys()
     end
 end
 
+-- ------------------------------------------------------------
+-- rewind（控制台命令 / 时间回溯）检测与恢复
+-- Repentance+ 的 rewind 会把整局倒回若干帧，并向模组重新发
+-- POST_PLAYER_INIT / POST_GAME_STARTED(continued=true) / POST_NEW_LEVEL。
+-- 如果照常按“新局/续档”清空，面板上的袋内容与本层掉落物就丢了。
+-- 判据：同一局（start seed 不变）且整局帧号（Game():GetFrameCount）倒退。
+-- 做法：先记 pending，下一帧帧号稳定后按目标帧恢复 BagTracker / Scan 的快照。
+-- ------------------------------------------------------------
+local function runInfo()
+    local seed, frame = nil, nil
+    pcall(function()
+        seed = Game():GetSeeds():GetStartSeed()
+    end)
+    pcall(function()
+        frame = Game():GetFrameCount()
+    end)
+    if type(seed) ~= "number" then
+        seed = nil
+    end
+    if type(frame) ~= "number" then
+        frame = nil
+    end
+    return seed, frame
+end
+
+local function isFrameDrop(frame)
+    if type(frame) ~= "number" or type(state.gameFrame) ~= "number" then
+        return false
+    end
+    -- 留 2 帧余量：回调与帧计数更新的先后顺序不一定一致
+    return frame + 2 < state.gameFrame
+end
+
+local function markRewind(source, frame)
+    if state.rewindPending ~= nil then
+        return
+    end
+    state.rewindPending = { fromFrame = state.gameFrame, source = source, frame = frame }
+    log("rewind detected (" .. tostring(source) .. "): frame " .. tostring(state.gameFrame)
+        .. " -> " .. tostring(frame) .. " (restore pending)")
+end
+
+-- 恢复袋内容 + 本层掉落物记录；下一帧再恢复（回调里读到的帧号可能还没稳定）
+local function applyRewind()
+    local pending = state.rewindPending
+    if pending == nil then
+        return
+    end
+    local seed, frame = runInfo()
+    if type(frame) ~= "number" then
+        frame = pending.frame or pending.fromFrame
+    end
+    if type(frame) ~= "number" then
+        state.rewindPending = nil
+        return
+    end
+    pending.waits = (pending.waits or 0) + 1
+    -- 帧号还没倒退（仍是回退前的值）→ 最多再等 10 帧
+    if pending.fromFrame ~= nil and frame >= pending.fromFrame and pending.waits <= 10 then
+        return
+    end
+    state.rewindPending = nil
+
+    local restoredBag = BagTracker.OnRewind(frame)
+    local rooms = Scan.RestoreAtFrame(frame)
+    BagEditor.Close(true)
+    state.gameFrame = frame
+    state.lastScanFrame = -100
+    state.chainKey = nil
+    state.job = nil
+    state.result = nil
+    state.searching = false
+    state.progress = 0
+    state.uncertainBag = false
+
+    log(string.format("rewind applied (source=%s frame=%s bagRestored=%s rooms=%d seed=%s)",
+        tostring(pending.source), tostring(frame), tostring(restoredBag), rooms,
+        tostring(seed or state.runSeed)))
+    if restoredBag then
+        setMessage("检测到时间回退，已恢复合成袋与本层掉落物信息")
+    else
+        setMessage("检测到时间回退，但没有可用记录，请按 F9 校正袋内容")
+    end
+end
+
 local function updateState()
     state.frame = state.frame + 1
     pollInput()
@@ -415,6 +504,22 @@ local function updateState()
     local player = getBagPlayer()
     if player == nil then
         return
+    end
+
+    -- rewind（控制台命令 / 时间回溯）检测：同一局里整局帧号倒退 ⇒ 先把状态恢复回去
+    local seed, frame = runInfo()
+    if seed ~= nil then
+        state.runSeed = seed
+    end
+    if frame ~= nil then
+        if state.rewindPending ~= nil then
+            applyRewind()
+        elseif isFrameDrop(frame) then
+            markRewind("frame-drop", frame)
+            applyRewind()
+        else
+            state.gameFrame = frame
+        end
     end
 
     BagTracker.Update(player)
@@ -483,7 +588,14 @@ end
 -- ------------------------------------------------------------
 
 -- 新的一局 / 续档：清空所有状态（续档时袋内容未知，需要 F9 校正）
+-- rewind（控制台命令 / 时间回溯）也走这个回调（isContinued=true），但它是“同一局往回走”，
+-- 不能清空：改为标记 pending，下一帧按目标帧恢复袋内容与本层掉落物（见 applyRewind）。
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
+    local seed, frame = runInfo()
+    if isContinued and seed ~= nil and state.runSeed ~= nil and seed == state.runSeed then
+        markRewind("game-started-continued", frame)
+        return
+    end
     Scan.ResetFloor()
     BagTracker.OnGameStarted(isContinued)
     BagEditor.Reset()
@@ -498,14 +610,20 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
     state.diagDone = false
     state.frame = 0
     state.editor = { active = false, cursor = 1, slots = {} }
+    state.runSeed = seed
+    state.gameFrame = frame
+    state.rewindPending = nil
     UI.Init()
     log("game started (continued=" .. tostring(isContinued) .. "), bag="
         .. BagTracker.GetConfidence() .. ", recipes=" .. tostring(BagTracker.GetCraftedCount()))
 end)
 
--- 换层：清空本层掉落物记录
+-- 换层：本层掉落物记录由 Scan 按楼层标识过滤（不再整体清空，历史留给 rewind 恢复）
 mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, function()
-    Scan.ResetFloor()
+    local _, frame = runInfo()
+    if isFrameDrop(frame) then
+        markRewind("new-level", frame)
+    end
     state.chainKey = nil
     state.lastLoggedSignature = nil
     log("new level")
@@ -521,6 +639,15 @@ end)
 -- 复活 / 中途加入：袋内容模拟可能已经和真实脱节（E6）
 mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, function(_, player)
     if player == nil then
+        return
+    end
+    -- rewind / 续档：等 applyRewind 恢复，不要把它当成“复活”置为未知
+    if state.rewindPending ~= nil then
+        return
+    end
+    local _, frame = runInfo()
+    if isFrameDrop(frame) then
+        markRewind("player-init", frame)
         return
     end
     -- 开局第一秒内的初始化属于正常开局（新局已对齐、续档已置为 unknown）

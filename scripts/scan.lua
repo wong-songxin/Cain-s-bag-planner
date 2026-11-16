@@ -9,7 +9,14 @@ local config = require("scripts.config")
 
 local Scan = {}
 
-local floorRooms = {}   -- [listIndex] = { atoms = {atom...} }
+local floorRooms = {}   -- [listIndex] = { atoms = {atom...}, signature = "...", frame = n, levelKey = "..." }
+-- ------------------------------------------------------------
+-- 回退（控制台 rewind / 时间回溯）恢复用：按游戏帧号记录「房间被扫描到的样子」。
+-- rewind 会把整局状态倒回若干帧，本层已探索房间的掉落物信息不能因此丢失；
+-- 内容没变的重复扫描不记新历史点，只在房间内容真的变化时追加。
+-- ------------------------------------------------------------
+local floorHistory = {} -- { { frame, levelKey, listIndex, atoms, signature }, ... }
+local HISTORY_LIMIT = 2000
 
 local function currentListIndex()
     local level = Game():GetLevel()
@@ -21,6 +28,74 @@ local function currentListIndex()
         return 0
     end
     return desc.ListIndex
+end
+
+-- 当前楼层标识：换层 / rewind 跨层时用来隔离不同楼层的扫描记录
+local function currentLevelKey()
+    local ok, stage, stageType = pcall(function()
+        local level = Game():GetLevel()
+        return level:GetStage(), level:GetStageType()
+    end)
+    if ok and type(stage) == "number" then
+        return tostring(stage) .. ":" .. tostring(stageType or 0)
+    end
+    return nil
+end
+
+-- 整局帧号（换房不归零）；取不到时返回 nil（不记录历史）
+local function currentGameFrame()
+    local value = nil
+    pcall(function()
+        value = Game():GetFrameCount()
+    end)
+    if type(value) == "number" then
+        return value
+    end
+    return nil
+end
+
+local function historyWindow()
+    local value = config.RewindFrames
+    if type(value) ~= "number" then
+        return 10800
+    end
+    return value
+end
+
+local function atomsSignature(atoms)
+    local parts = {}
+    for _, atom in ipairs(atoms or {}) do
+        parts[#parts + 1] = atom.kind .. "x" .. tostring(atom.count or 1)
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
+end
+
+local function noteFloorHistory(frame, levelKey, listIndex, atoms, signature)
+    if historyWindow() <= 0 or frame == nil then
+        return
+    end
+    local last = floorHistory[#floorHistory]
+    if last ~= nil and last.frame == frame and last.listIndex == listIndex
+        and last.levelKey == levelKey then
+        last.atoms = atoms
+        last.signature = signature
+    else
+        floorHistory[#floorHistory + 1] = {
+            frame = frame,
+            levelKey = levelKey,
+            listIndex = listIndex,
+            atoms = atoms,
+            signature = signature,
+        }
+    end
+    local cutoff = frame - historyWindow()
+    while #floorHistory > 1 and floorHistory[1].frame < cutoff do
+        table.remove(floorHistory, 1)
+    end
+    while #floorHistory > HISTORY_LIMIT do
+        table.remove(floorHistory, 1)
+    end
 end
 
 local function isShopItem(entity)
@@ -124,29 +199,49 @@ function Scan.ScanRoom()
     end
     result.atoms = aggregate(raw)
 
-    -- 会“拿走/吃掉”掉落物的非玩家实体：使魔、Bumbino、Ultra Greed、老虎机/乞丐
-    -- 事件模拟时用它们的位置判断“这个掉落物不是玩家拿的”
-    local COLLECTOR_TYPES = {
-        EntityType.ENTITY_FAMILIAR,
-        EntityType.ENTITY_SLOT,
+    -- 会“吃掉”场上掉落物的实体：官方只有这 5 个跟班（其余实体——包括捐款机等所有 slot、
+    -- Bumbino、Ultra Greed——都不会吃地上的掉落物；把它们算成收集者会让袋子吸走的掉落物被误跳过）。
+    -- id = type.variant.subtype，subtype 固定 0：
+    --   3.24.0  Bum Friend   3.64.0  Dark Bum   3.88.0  Bumbo
+    --   3.90.0  Key Bum      3.102.0 Super Bum
+    local PICKUP_EATING_FAMILIARS = {
+        [24] = "Bum Friend",
+        [64] = "Dark Bum",
+        [88] = "Bumbo",
+        [90] = "Key Bum",
+        [102] = "Super Bum",
     }
-    if EntityType.ENTITY_BUMBINO ~= nil then
-        COLLECTOR_TYPES[#COLLECTOR_TYPES + 1] = EntityType.ENTITY_BUMBINO
-    end
-    if EntityType.ENTITY_ULTRA_GREED ~= nil then
-        COLLECTOR_TYPES[#COLLECTOR_TYPES + 1] = EntityType.ENTITY_ULTRA_GREED
-    end
-    for _, entityType in ipairs(COLLECTOR_TYPES) do
-        local found = Isaac.FindByType(entityType, -1, -1, false, false)
-        for _, entity in ipairs(found) do
+    if config.CollectorSkip ~= false and EntityType.ENTITY_FAMILIAR ~= nil then
+        local extraCollectors = config.ExtraCollectorFamiliars
+        for _, entity in ipairs(Isaac.FindByType(EntityType.ENTITY_FAMILIAR, -1, -1, false, false)) do
             local posX, posY = nil, nil
+            local variant, subtype, entityIndex = nil, nil, nil
             pcall(function()
                 posX = entity.Position.X
                 posY = entity.Position.Y
+                variant = entity.Variant
+                subtype = entity.SubType
+                entityIndex = entity.Index
             end)
-            if posX ~= nil and posY ~= nil then
+            local name = nil
+            if variant ~= nil and (subtype == nil or subtype == 0) then
+                name = PICKUP_EATING_FAMILIARS[variant]
+                if name == nil and type(extraCollectors) == "table" then
+                    local extra = extraCollectors[variant]
+                    if extra == true then
+                        name = "extra:" .. tostring(variant)
+                    elseif type(extra) == "string" then
+                        name = extra
+                    end
+                end
+            end
+            if name ~= nil and posX ~= nil and posY ~= nil then
                 result.collectors[#result.collectors + 1] = {
-                    type = entityType,
+                    type = EntityType.ENTITY_FAMILIAR,
+                    variant = variant,
+                    subtype = subtype,
+                    index = entityIndex,
+                    name = name,
                     x = posX,
                     y = posY,
                 }
@@ -154,16 +249,33 @@ function Scan.ScanRoom()
         end
     end
 
-    floorRooms[result.listIndex] = { atoms = result.atoms }
+    local levelKey = currentLevelKey()
+    local frame = currentGameFrame()
+    local signature = atomsSignature(result.atoms)
+    local existing = floorRooms[result.listIndex]
+    if existing == nil or existing.signature ~= signature or existing.levelKey ~= levelKey then
+        floorRooms[result.listIndex] = {
+            atoms = result.atoms,
+            signature = signature,
+            frame = frame,
+            levelKey = levelKey,
+        }
+        noteFloorHistory(frame, levelKey, result.listIndex, result.atoms, signature)
+    end
+    result.levelKey = levelKey
+    result.frame = frame
     return result
 end
 
--- 本层所有房间合并后的原子清单
+-- 本层所有房间合并后的原子清单（换层 / 回退后只统计当前楼层）
 function Scan.GetFloorAtoms()
     local all = {}
+    local levelKey = currentLevelKey()
     for _, room in pairs(floorRooms) do
-        for _, atom in ipairs(room.atoms) do
-            all[#all + 1] = atom
+        if levelKey == nil or room.levelKey == levelKey then
+            for _, atom in ipairs(room.atoms) do
+                all[#all + 1] = atom
+            end
         end
     end
     return aggregate(all)
@@ -246,12 +358,58 @@ end
 
 function Scan.ResetFloor()
     floorRooms = {}
+    floorHistory = {}
+end
+
+-- 回退（控制台 rewind）后调用：把本层房间记录恢复到目标帧之前的状态
+-- frame = Game():GetFrameCount()（整局帧号）；返回恢复后的房间数
+function Scan.RestoreAtFrame(frame)
+    local target = frame
+    if type(target) ~= "number" then
+        target = currentGameFrame()
+    end
+    if type(target) ~= "number" then
+        return Scan.GetFloorRoomCount()
+    end
+    -- 目标帧之前没有任何记录（模组刚加载 / 回退超出保留窗口）→ 保留现有扫描结果，别清空
+    local usable = {}
+    for _, entry in ipairs(floorHistory) do
+        if entry.frame <= target then
+            usable[#usable + 1] = entry
+        end
+    end
+    if #usable == 0 then
+        return Scan.GetFloorRoomCount()
+    end
+    -- 目标帧之后的记录属于「被回退掉的时间线」，已失效（玩家可能换了操作）
+    floorHistory = usable
+    local levelKey = currentLevelKey()
+    floorRooms = {}
+    for _, entry in ipairs(usable) do
+        if levelKey == nil or entry.levelKey == levelKey then
+            floorRooms[entry.listIndex] = {
+                atoms = entry.atoms,
+                signature = entry.signature,
+                frame = entry.frame,
+                levelKey = entry.levelKey,
+            }
+        end
+    end
+    return Scan.GetFloorRoomCount()
+end
+
+-- 历史点数（日志 / 离线测试用）
+function Scan.GetHistoryCount()
+    return #floorHistory
 end
 
 function Scan.GetFloorRoomCount()
     local n = 0
-    for _ in pairs(floorRooms) do
-        n = n + 1
+    local levelKey = currentLevelKey()
+    for _, room in pairs(floorRooms) do
+        if levelKey == nil or room.levelKey == levelKey then
+            n = n + 1
+        end
     end
     return n
 end
