@@ -13,7 +13,8 @@
 > - `step3_bag_state.md` 袋状态识别：逐帧入袋 + F9 校正 + 可信度（勿改）
 > - `step4_pickup_attribution.md` 拾取归属：玩家自己捡的不计入袋（**已实现**，见 §3.2 / §5 / §8）
 > - `step5_crafted_recipes_and_scope.md` 袋里出现过的配方不再展示 + 去掉 Tab 范围切换（**已实现**，口径见 §9）
-> - `step6_handoff.md` **下一轮交接 Prompt**：现状 / 口径速查 / 行号锚点 / 待修 bug 清单（双素材、主动合成已修；偶发漏记待修）
+> - `step6_handoff.md` 0.7.0 → 0.9.0 的 bug 修复轮 Prompt：rewind 恢复 / Q 窗口拾取归属 / 收集者口径（**已实现**）
+> - `step7_handoff.md` **下一轮交接 Prompt**：UI 面板战斗中默认隐藏 + 袋信息跨会话保留（待实现）
 
 ## 0. 当前进度（里程碑）
 
