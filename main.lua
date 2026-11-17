@@ -13,11 +13,41 @@ local BagTracker = require("scripts.bag_tracker")
 local BagEditor = require("scripts.bag_editor")
 local Chain = require("scripts.chain")
 local UI = require("scripts.ui")
+local Persist = require("scripts.persist")
 
 local BAG_SIZE = 8
 
+-- 面板显示模式（F5 循环 auto → on → off → auto）
+local PANEL_MODES = { "auto", "on", "off" }
+
+local function initialPanelMode()
+    local mode = config.PanelMode
+    for _, name in ipairs(PANEL_MODES) do
+        if mode == name then
+            return mode
+        end
+    end
+    -- 兼容旧配置：PanelVisibleByDefault = false → 关闭
+    return config.PanelVisibleByDefault == false and "off" or "auto"
+end
+
+local function nextPanelMode(mode)
+    for i = 1, #PANEL_MODES do
+        if PANEL_MODES[i] == mode then
+            return PANEL_MODES[(i % #PANEL_MODES) + 1]
+        end
+    end
+    return "auto"
+end
+
+local startPanelMode = initialPanelMode()
+
 local state = {
-    visible = config.PanelVisibleByDefault,
+    visible = (startPanelMode ~= "off"),
+    panelMode = startPanelMode,
+    panelHidden = nil,          -- "off" / "combat"（visible=false 的原因）
+    panelVisibleKey = nil,      -- 只在可见性 / 模式变化时写日志
+    combatHideFrames = 0,       -- 连续「未清房」的帧数（grace 用）
     slots = {},
     atoms = {},
     counts = {},
@@ -49,6 +79,11 @@ local state = {
     gameFrame = nil,
     runSeed = nil,
     rewindPending = nil,
+    gameStarted = false,        -- 本次进程是否已经走过 POST_GAME_STARTED（区分「新进程续档」）
+    -- 跨会话持久化：脏标记 / 上次写盘帧 / 上次写盘时的袋 + 配方史
+    persistDirty = false,
+    persistFrame = -1000,
+    persistKey = nil,
 }
 
 local function log(text)
@@ -61,6 +96,61 @@ end
 local function setMessage(text)
     state.message = text
     state.messageUntil = Isaac.GetTime() + 3000
+end
+
+-- ------------------------------------------------------------
+-- 面板显示模式（step7-A）：auto / on / off
+--   auto：清房显示、战斗中隐藏（连续 CombatHideGraceFrames 帧不清房才隐藏）
+--   on  ：始终显示（战斗中也不隐藏）
+--   off ：始终不显示（连链搜索一起停）
+-- state.visible 只是「最终是否绘制」的派生值，UI 仍然只看它。
+-- ------------------------------------------------------------
+local function roomIsClear()
+    local ok, clear = pcall(function()
+        return Game():GetRoom():IsClear()
+    end)
+    if ok and type(clear) == "boolean" then
+        return clear
+    end
+    -- 取不到就当作已清房（保持旧行为：面板照常显示）
+    return true
+end
+
+local function updatePanelVisibility()
+    local mode = state.panelMode
+    local visible, reason = true, nil
+    if mode == "off" then
+        visible, reason = false, "off"
+    elseif mode == "on" then
+        visible, reason = true, nil
+        state.combatHideFrames = 0
+    else
+        local clear = roomIsClear()
+        local grace = tonumber(config.CombatHideGraceFrames) or 30
+        if clear then
+            state.combatHideFrames = 0
+        else
+            state.combatHideFrames = state.combatHideFrames + 1
+        end
+        local combat = config.HideDuringCombat ~= false and not clear and state.combatHideFrames > grace
+        if BagEditor.IsActive() then
+            -- F9 校正期间必须能看到面板（F5 显式的 on/off 仍优先，见上面的分支）
+            visible, reason = true, nil
+        elseif combat then
+            visible, reason = false, "combat"
+        else
+            visible, reason = true, nil
+        end
+    end
+
+    local key = tostring(mode) .. "|" .. tostring(visible) .. "|" .. tostring(reason)
+    if state.panelVisibleKey ~= key then
+        state.panelVisibleKey = key
+        log(string.format("panel mode=%s visible=%s%s", tostring(mode), tostring(visible),
+            reason ~= nil and (" (" .. reason .. ")") or ""))
+    end
+    state.visible = visible
+    state.panelHidden = (not visible) and (reason or "off") or nil
 end
 
 local function getBagPlayer()
@@ -331,8 +421,13 @@ local function toggleBagEditor()
         setMessage("已退出校正（修改未保存）")
         return
     end
+    -- F9 必须能看到面板：off 模式下先切回 auto（F5 的显式选择仍可随时改回来）
+    if state.panelMode == "off" then
+        state.panelMode = "auto"
+        log("panel mode=off -> auto (editor opened)")
+    end
     BagEditor.Open({ counts = state.counts, roomCounts = state.roomCounts })
-    state.visible = true
+    updatePanelVisibility()
     setMessage("校正袋内容：←/→ 选格  ↑/↓ 换素材  Enter 确认  F9 退出")
 end
 
@@ -362,9 +457,15 @@ end
 
 local function handleHotkeys()
     if pressed("toggle") then
-        state.visible = not state.visible
-        log("panel visible=" .. tostring(state.visible))
-        setMessage(state.visible and "面板已开启" or "面板已关闭")
+        state.panelMode = nextPanelMode(state.panelMode)
+        updatePanelVisibility()
+        if state.panelMode == "auto" then
+            setMessage("面板：自动（清房显示 / 战斗隐藏）")
+        elseif state.panelMode == "on" then
+            setMessage("面板：始终显示")
+        else
+            setMessage("面板：关闭")
+        end
     end
 
     if pressed("editBag") then
@@ -437,6 +538,130 @@ local function runInfo()
     return seed, frame
 end
 
+-- ------------------------------------------------------------
+-- 跨会话持久化（step7-B）：只通过 Isaac.SaveModData / LoadModData（模组数据）
+-- 绝不直接读写游戏存档文件；读写失败一律降级（不影响游戏）。
+-- ------------------------------------------------------------
+local function stageInfo()
+    local stage, stageType, listIndex = nil, nil, nil
+    pcall(function()
+        stage = Game():GetLevel():GetStage()
+    end)
+    pcall(function()
+        stageType = Game():GetLevel():GetStageType()
+    end)
+    pcall(function()
+        local desc = Game():GetLevel():GetCurrentRoomDesc()
+        if desc ~= nil then
+            listIndex = desc.ListIndex
+        end
+    end)
+    if type(stage) ~= "number" then
+        stage = nil
+    end
+    if type(stageType) ~= "number" then
+        stageType = nil
+    end
+    if type(listIndex) ~= "number" then
+        listIndex = nil
+    end
+    return stage, stageType, listIndex
+end
+
+local function buildPersistPayload()
+    local seed, frame = runInfo()
+    local stage, stageType, listIndex = stageInfo()
+    local snap = BagTracker.GetPersistState()
+    local savedAt = nil
+    pcall(function()
+        savedAt = Isaac.GetTime()
+    end)
+    return {
+        v = 1,
+        seed = seed or state.runSeed,
+        frame = frame or state.gameFrame or 0,
+        stage = stage,
+        stageType = stageType,
+        listIndex = listIndex,
+        savedAt = savedAt,
+        slots = snap.slots,
+        history = snap.history,
+        seen = snap.seen,
+        crafted = snap.crafted,
+    }
+end
+
+local function savePersist(reason)
+    if config.Persist == false or state.runSeed == nil then
+        return false
+    end
+    local payload = buildPersistPayload()
+    local ok = Persist.Save(mod, payload)
+    if not ok then
+        log("persist: save failed")
+        return false
+    end
+    state.persistDirty = false
+    state.persistFrame = state.frame
+    state.persistKey = BagTracker.GetKey() .. "|" .. tostring(BagTracker.GetCraftedRevision())
+    log(string.format("persist: saved frame=%s bag=[%s] (%s)", tostring(payload.frame),
+        table.concat(payload.slots or {}, ","), tostring(reason)))
+    return true
+end
+
+local function clearPersist(reason)
+    if config.Persist == false then
+        return
+    end
+    Persist.Clear(mod)
+    state.persistDirty = false
+    state.persistKey = nil
+    log("persist: cleared (" .. tostring(reason) .. ")")
+end
+
+-- 新进程续档：seed 必须一致；stage / stageType 取得到就必须一致（防串档）
+local function restorePersist(seed, frame)
+    local payload, err = Persist.Load(mod)
+    if payload == nil then
+        log("persist: ignored (" .. tostring(err or "no data") .. ")")
+        return false
+    end
+    if payload.seed ~= seed then
+        log(string.format("persist: ignored (seed mismatch saved=%s current=%s)",
+            tostring(payload.seed), tostring(seed)))
+        return false
+    end
+    local stage, stageType = stageInfo()
+    if payload.stage ~= nil and stage ~= nil and payload.stage ~= stage then
+        log(string.format("persist: ignored (stage mismatch saved=%s current=%s)",
+            tostring(payload.stage), tostring(stage)))
+        return false
+    end
+    if payload.stageType ~= nil and stageType ~= nil and payload.stageType ~= stageType then
+        log(string.format("persist: ignored (stageType mismatch saved=%s current=%s)",
+            tostring(payload.stageType), tostring(stageType)))
+        return false
+    end
+    local restoreFrame = frame
+    if type(restoreFrame) ~= "number" then
+        restoreFrame = payload.frame
+    end
+    local ok, snapshotFrame, fallback = BagTracker.RestoreFromPersist(payload, restoreFrame)
+    if not ok then
+        log("persist: ignored (restore failed)")
+        return false
+    end
+    state.persistDirty = false
+    state.persistFrame = state.frame
+    state.persistKey = BagTracker.GetKey() .. "|" .. tostring(BagTracker.GetCraftedRevision())
+    state.chainKey = nil
+    log(string.format("persist: restored frame=%s (snapshot %s%s) bag=[%s] recipes=%d",
+        tostring(restoreFrame), tostring(snapshotFrame), fallback and ", fallback" or "",
+        table.concat(BagTracker.GetSlots(), ","), BagTracker.GetCraftedCount()))
+    setMessage("已恢复上次的袋内容（退出前的模拟）")
+    return true
+end
+
 local function isFrameDrop(frame)
     if type(frame) ~= "number" or type(state.gameFrame) ~= "number" then
         return false
@@ -490,6 +715,8 @@ local function applyRewind()
     log(string.format("rewind applied (source=%s frame=%s bagRestored=%s rooms=%d seed=%s)",
         tostring(pending.source), tostring(frame), tostring(restoredBag), rooms,
         tostring(seed or state.runSeed)))
+    -- 回退后的状态也要写回持久化（否则下次续档会拿到回退前的袋）
+    savePersist("rewind")
     if restoredBag then
         setMessage("检测到时间回退，已恢复合成袋与本层掉落物信息")
     else
@@ -559,6 +786,9 @@ local function updateState()
     state.notCain = not BagTracker.IsTracking()
     state.editor = BagEditor.GetState()
 
+    -- 面板可见性（F5 可能在本帧刚改过模式；F9 编辑器也在这里强制显示）
+    updatePanelVisibility()
+
     if state.visible then
         ensureChain()
         if state.job ~= nil and not state.job.done then
@@ -568,6 +798,28 @@ local function updateState()
             if state.job.done then
                 finishChain()
             end
+        end
+    else
+        -- 隐藏时不跑链搜索（省 CPU）；重新显示时 chainKey 为空 → 自动重算
+        if state.job ~= nil or state.searching or state.chainKey ~= nil then
+            state.job = nil
+            state.result = nil
+            state.chainKey = nil
+            state.searching = false
+            state.progress = 0
+        end
+    end
+
+    -- 持久化：袋 / 配方史变化 → 打脏标记；按帧节流写一次（避免每帧写 ModData）
+    if config.Persist ~= false then
+        local persistKey = BagTracker.GetKey() .. "|" .. tostring(BagTracker.GetCraftedRevision())
+        if state.persistKey ~= persistKey then
+            state.persistKey = persistKey
+            state.persistDirty = true
+        end
+        local interval = tonumber(config.PersistFrameInterval) or 60
+        if state.persistDirty and (state.frame - (state.persistFrame or 0)) >= interval then
+            savePersist("throttle")
         end
     end
 
@@ -587,15 +839,19 @@ end
 -- 回调注册
 -- ------------------------------------------------------------
 
--- 新的一局 / 续档：清空所有状态（续档时袋内容未知，需要 F9 校正）
+-- 新的一局 / 续档：清空所有状态；续档随后会从模组数据恢复（恢复失败才需要 F9 校正）
 -- rewind（控制台命令 / 时间回溯）也走这个回调（isContinued=true），但它是“同一局往回走”，
 -- 不能清空：改为标记 pending，下一帧按目标帧恢复袋内容与本层掉落物（见 applyRewind）。
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
     local seed, frame = runInfo()
-    if isContinued and seed ~= nil and state.runSeed ~= nil and seed == state.runSeed then
+    -- 同一进程里已经开过一局：续档 + seed 相同 ⇒ 视为 rewind（新进程才算「从模组数据恢复」）
+    local sameSession = state.gameStarted == true
+    if isContinued and sameSession and seed ~= nil and state.runSeed ~= nil and seed == state.runSeed then
         markRewind("game-started-continued", frame)
         return
     end
+    local newProcessContinue = isContinued and not sameSession
+    state.gameStarted = true
     Scan.ResetFloor()
     BagTracker.OnGameStarted(isContinued)
     BagEditor.Reset()
@@ -613,9 +869,28 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
     state.runSeed = seed
     state.gameFrame = frame
     state.rewindPending = nil
+    state.combatHideFrames = 0
+    state.panelVisibleKey = nil
+    state.persistDirty = false
+    state.persistKey = nil
+    state.persistFrame = -1000
+
+    local restored = false
+    if newProcessContinue then
+        if config.Persist ~= false and seed ~= nil then
+            restored = restorePersist(seed, frame)
+        else
+            log("persist: ignored (no seed)")
+        end
+    elseif not isContinued then
+        -- 新开一局（不 Continue）：袋为空、配方史清空，持久化数据也一并清掉
+        clearPersist("new-run")
+    end
+
     UI.Init()
     log("game started (continued=" .. tostring(isContinued) .. "), bag="
-        .. BagTracker.GetConfidence() .. ", recipes=" .. tostring(BagTracker.GetCraftedCount()))
+        .. BagTracker.GetConfidence() .. ", recipes=" .. tostring(BagTracker.GetCraftedCount())
+        .. ", persistRestored=" .. tostring(restored))
 end)
 
 -- 换层：本层掉落物记录由 Scan 按楼层标识过滤（不再整体清空，历史留给 rewind 恢复）
@@ -634,6 +909,21 @@ mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, function()
     BagTracker.OnNewRoom()
     BagEditor.Close(true)
     state.chainKey = nil
+    -- 记录“最后进过的房间”：续档时按这里的 listIndex 与恢复帧一起使用
+    savePersist("new-room")
+end)
+
+-- 退出游戏 / 回主菜单：把当前袋内容与配方史写进模组数据（按存档位隔离）
+mod:AddCallback(ModCallbacks.MC_PRE_GAME_EXIT, function(_, shouldSave)
+    savePersist(shouldSave == false and "game-exit-unsaved" or "game-exit")
+end)
+
+-- 一局结束：游戏结束（gameOver=true）才清空；其它（如胜利后继续）保留
+mod:AddCallback(ModCallbacks.MC_POST_GAME_END, function(_, gameOver)
+    state.gameStarted = false
+    if gameOver == true then
+        clearPersist("game-over")
+    end
 end)
 
 -- 复活 / 中途加入：袋内容模拟可能已经和真实脱节（E6）
@@ -641,7 +931,7 @@ mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, function(_, player)
     if player == nil then
         return
     end
-    -- rewind / 续档：等 applyRewind 恢复，不要把它当成“复活”置为未知
+    -- rewind：等 applyRewind 恢复，不要把它当成“复活”置为未知
     if state.rewindPending ~= nil then
         return
     end
@@ -650,7 +940,7 @@ mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, function(_, player)
         markRewind("player-init", frame)
         return
     end
-    -- 开局第一秒内的初始化属于正常开局（新局已对齐、续档已置为 unknown）
+    -- 开局第一秒内的初始化属于正常开局（新局已对齐、续档已尝试从持久化恢复）
     if state.frame < 90 or BagTracker.IsUnknown() then
         return
     end

@@ -14,7 +14,7 @@
 > - `step4_pickup_attribution.md` 拾取归属：玩家自己捡的不计入袋（**已实现**，见 §3.2 / §5 / §8）
 > - `step5_crafted_recipes_and_scope.md` 袋里出现过的配方不再展示 + 去掉 Tab 范围切换（**已实现**，口径见 §9）
 > - `step6_handoff.md` 0.7.0 → 0.9.0 的 bug 修复轮 Prompt：rewind 恢复 / Q 窗口拾取归属 / 收集者口径（**已实现**）
-> - `step7_handoff.md` **下一轮交接 Prompt**：UI 面板战斗中默认隐藏 + 袋信息跨会话保留（待实现）
+> - `step7_handoff.md` 交接 Prompt：UI 面板战斗中默认隐藏 + 袋信息跨会话保留（**已实现**，见 §2 / §4 / §5 第 8 条）
 
 ## 0. 当前进度（里程碑）
 
@@ -36,8 +36,9 @@
 | **step5：出现过的配方去重 + 去掉 Tab 范围切换**（满 8 格出现过即拉黑，见 §9） | ✅ 离线 | `scripts/recipe.lua`、`chain.lua`、`bag_tracker.lua`、`main.lua`、`ui.lua` |
 | **bug 修复（step6）**：双素材掉落物按「一次拾取 = 一个动作」建模；已有另一个主动道具时合成主动也会清空 | ✅ 离线 | `chain.lua`、`ui.lua`、`bag_tracker.lua` |
 | **bug 修复（step7）**：控制台 `rewind` 后合成袋 / 本层掉落物信息按目标帧恢复（不再丢失）；普通拾取 vs 袋吸收改用「Q 是否举起 + 位置是否重叠」判定；**收集者名单收窄为官方 5 个 bum 跟班**（捐款机等 slot 不再误伤） | ✅ 离线（待实机复验） | `bag_tracker.lua`、`scan.lua`、`main.lua`、`config.lua` |
+| **0.10.0（step7 交接）**：面板战斗中默认隐藏（F5 三态 `auto/on/off`、F9 强制显示、隐藏时停链搜索）；退出游戏再进入（Continue）时按模组数据恢复袋内容与配方史 | ✅ 离线（待实机复验） | `main.lua`、`scripts/persist.lua`、`bag_tracker.lua`、`config.lua`、`ui.lua` |
 | REPENTOGON 直读（可选、自动探测、异常回退事件模拟） | ⚠️ 代码就绪，本机未装未实测 | `bag_tracker.detectDirectRead / readDirectBag` |
-| 离线测试 | ✅ 301 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
+| 离线测试 | ✅ 362 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
 
 **待验证 / 待办（按优先级）**
 
@@ -52,6 +53,11 @@
 7. **偶发漏记（已知未修）**：连续快速吸取多个掉落物时，个别掉落物可能没被识别入袋
    （挥袋动画同帧重叠 + 归属证据缺失）。当前用 `F9` 手工补正；后续排查可对比 `attr` 与 `skip collect` 日志的时间戳，
    以及 §8 新增的 `scan vanished` / `room-entry pending` 诊断行（收集者误伤已在 0.9.0 收窄为官方 5 个 bum 跟班）；
+8. **面板战斗中隐藏的实机复验**：进有敌人的房间 → 面板消失（`panel ... visible=false (combat)`）且不再 `search started`；
+   清房后自动出现；`F5` 三态与 F9 强制显示符合预期；确认 Greed 波次 / Boss 房 `Room:IsClear()` 的行为；
+9. **跨会话持久化的实机复验**：退出到桌面 → 重启 → Continue，日志应出现 `persist: saved ...` / `persist: restored frame=..`，
+   面板直接显示退出前的 8 格与配方史；**重点核对游戏续档点是否落在本房入口**（`history` 会按恢复帧挑快照，最多 32 条）；
+   以及多个存档位之间互不串数据（`Isaac.SaveModData` 本身按存档位隔离）；
 
 ## 1. 安装
 
@@ -64,7 +70,7 @@
    ```
 
 2. 启动游戏 → `Mods` 菜单 → 启用 **Cain's Bag Planner**（Private 模组需要在 `Mods` 里手动开启）。
-3. 进一局后默认自动显示面板；`F5` 可以关闭/打开。
+3. 进一局后默认 `auto` 显示：清房时显示面板，战斗（未清房）超过 `CombatHideGraceFrames` 帧后自动隐藏；`F5` 循环 `auto → on → off → auto`。
 
 卸载：关闭游戏后删除 junction（`Remove-Item "…\mods\CainsBag"`）即可，不会动到源码目录。
 
@@ -88,7 +94,7 @@ git clone https://github.com/<你的用户名>/CainsBag.git CainsBag
 
 | 按键 | 作用 |
 | --- | --- |
-| `F5` | 开/关面板（校正过程中关面板不会丢修改） |
+| `F5` | 循环面板显示模式：`auto`（清房显示 / 战斗中隐藏）→ `on`（始终显示）→ `off`（始终不显示，连链搜索一起停）→ `auto`；校正过程中切换不会丢修改，底部会提示当前模式 |
 | `F6` | 把袋模拟校准为空袋（**合成后已自动清空**，只在"想手动重新同步一次"时才需要；替换袋内容请用 `F9`；直读模式下无需校准） |
 | `F7` | 强制重算 |
 | `F8` | 切换中文 / 英文（字体不含中文字形时用它切到英文） |
@@ -115,7 +121,7 @@ git clone https://github.com/<你的用户名>/CainsBag.git CainsBag
  3 放 双硬币（顶掉硬币、钥匙）→ 配方#2 币 币 币 币 红 红 钥 钥
  4 放 幸运币（顶掉硬币）→ 配方#3（同 #2） …
 ----------------------------------------
-F5 关闭  F6 校准  F7 重算  F8 语言  F9 校正袋  方向键 滚动
+F5 显示模式  F6 校准  F7 重算  F8 语言  F9 校正袋  方向键 滚动
 ```
 
 - **不同配方**：链上出现过的互不相同的 8 素材多重集数量（**不含**袋里已经出现过的组合，见下一条）。
@@ -143,7 +149,7 @@ F5 关闭  F6 校准  F7 重算  F8 语言  F9 校正袋  方向键 滚动
 
 - `#1` 是最旧的一格（下一个被顶掉的格子）；只填前 N 格表示袋未满，后续拾取会继续追加。
 - 候选顺序：`--`（空）→ 本房间已扫描到的素材 → 本层 / 背包里的卡牌药丸 → 全部 0..29 素材。
-- `Enter` 写入后立即重算链条；`F9` 退出时草稿会保留（再按 `F9` 可继续），`F5` 关面板也不会丢。
+- `Enter` 写入后立即重算链条；`F9` 退出时草稿会保留（再按 `F9` 可继续），`F5` 切换显示模式也不会丢。
 
 ### 3.2 袋内内容是怎么来的（识别链路概要）
 
@@ -163,13 +169,17 @@ REPENTOGON 可用？
 ```
 
 - 每一步都会写日志（`attr` / `skip collect` / `veto passed` / `craft detected` / `bag cleared`），排查见 §8。
-- 可信度：新局或 `F6`/`F9`/合成清空 → `known`；连续入袋 → `tracking`；`use-item` 未满 / 计数器核对异常 → `uncertain`；续档 / 复活 → `unknown`。
+- 可信度：新局或 `F6`/`F9`/合成清空 → `known`；连续入袋 → `tracking`；`use-item` 未满 / 计数器核对异常 → `uncertain`；
+  续档时先用模组数据恢复 → `known(restored)`；恢复失败（首次装模组 / 数据损坏 / seed·stage 不匹配）或复活 → `unknown`。
 
 ## 4. 配置（`scripts/config.lua`）
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `PanelVisibleByDefault` | `true` | 进局后默认显示面板（热键见 §2） |
+| `PanelMode` | `"auto"` | 面板显示模式：`auto` = 清房显示 / 战斗中隐藏；`on` = 始终显示；`off` = 始终不显示（连链搜索一起停）。`F5` 循环切换 |
+| `PanelVisibleByDefault` | `true` | 兼容旧配置：仅当 `PanelMode` 缺省 / 非法时用它推导初始模式（`false` → `off`） |
+| `HideDuringCombat` | `true` | `auto` 模式下战斗中隐藏面板（`Game():GetRoom():IsClear() == false`） |
+| `CombatHideGraceFrames` | `30` | 进房后连续多少帧仍未清房才隐藏（避免敌人还没刷全时闪一下） |
 | `Debug` | `true` | 把素材计数、链条结果、耗时写入 `log.txt`（**不向控制台打印**，避免刷屏） |
 | `DebugMarker` | `true` | 在屏幕左上角画自检标记 `CB <drawApi>`：**看得到标记 = 渲染通道是通的**；发布时可改 `false` |
 | `BeamWidth` | `80` | Beam Search 束宽，越大越准、越慢 |
@@ -194,6 +204,9 @@ REPENTOGON 可用？
 | `BagSwipeFrames` | `30` | **「举起合成袋（Q）」窗口**：按住期间每帧刷新，松手后再宽限这么多帧都算「袋吸收」；窗口外 + 与玩家重叠 ⇒ 普通拾取 |
 | `PickupOverlapDistance` | `26` | 「与玩家重叠」的距离阈值（≈玩家 + 掉落物碰撞半径之和；实测普通拾取 ≤23、袋吸收 ≥30） |
 | `RewindFrames` | `10800` | 控制台 `rewind` 的历史保留窗口（帧，60fps ≈ 3 分钟）；0 = 关闭（回退后按未知处理） |
+| `Persist` | `true` | 跨会话持久化总开关：退出游戏再进入（Continue）时用模组数据恢复袋内容与配方史；`false` = 续档后按未知处理（需 F9） |
+| `PersistHistoryMax` | `32` | 持久化包里保留的袋快照条数（续档时按恢复帧挑最新一份，避免多算本房拾取） |
+| `PersistFrameInterval` | `60` | 袋 / 配方史变化后的写盘节流（帧）；退出 / 换房 / rewind 时会立即写一次 |
 | `CounterVeto` | `true` | 计数器/槽位否决：钱 / 钥匙 / 炸弹 / 红心变多，或卡牌 / 药丸槽变化 ⇒ 这次是普通拾取 ⇒ 撤销刚才的入袋（回滚并重算） |
 | `CounterVetoFrames` | `20` | 否决观察窗口（帧）：拾取结算可能晚于 `Collect` 动画，别设太小 |
 | `ChargeProbe` | `true` | 袋容量探针：只读 `GetActiveCharge()/GetActiveMaxCharge()`。**不参与判定**，只在「跳过之后袋容量反而涨了」时打 `WARN`（说明归属判定可能反了） |
@@ -238,7 +251,8 @@ REPENTOGON 可用？
        若「判成普通拾取而跳过」之后袋容量反而上涨，会额外打一条
        `WARN: bag charge rose after skip (reason=...)`，说明本机版本的归属语义可能与预期相反，
        把 `config.Attribution` 改成 `"legacy"` 即可对比。
-     - 中途启用模组、继续存档、复活（`player init`）都会把状态置为「未知」，按 `F9` 照游戏内实际 8 格录入即可。
+     - 中途启用模组、复活（`player init`）都会把状态置为「未知」，按 `F9` 照游戏内实际 8 格录入即可；
+  正常续档（Continue）会先用模组数据恢复（见第 8 条），恢复不了（首次装模组 / 数据损坏 / seed·stage 不匹配）才降级为 `unknown`。
      - **合成后自动清空（不用按 `F6`）**：三个信号取并集，任一命中就清空袋模拟并把可信度置为 `known`：
        1. **道具数 +1**（合成出被动道具）：`craft detected: collectibles X -> Y, bag was [...]` + `bag cleared: craft`；
        2. **袋子被顶掉**（合成出主动道具、且没有第二个主动槽）：`HasCollectible(710)` 变 false
@@ -283,11 +297,21 @@ REPENTOGON 可用？
 6. 非堕化该隐也能用面板，但无法轮转袋内顺序，面板提示「非该隐：顶掉需手动丢弃顺序」。
 7. 商店里**未购买**的商品不计入可用素材；**购买属于普通拾取**（扣钱、进背包），按 step4 的归属语义**不计入**袋；
    只有挥袋收进袋子的掉落物才计入。入袋事件逐帧识别，扫描列表（本层素材统计）每 2 帧刷新一次。
+8. **跨会话持久化（0.10.0）**：只使用模组数据 `Isaac.SaveModData / LoadModData / HasModData / RemoveModData`
+   （忏悔原生，按**当前存档位**隔离），**绝不直接读写游戏存档文件**。
+   - 保存点：退出游戏 / 回主菜单（`MC_PRE_GAME_EXIT`）、换房（`MC_POST_NEW_ROOM`）、袋或配方史变化后节流（`PersistFrameInterval`，默认 60 帧）、`rewind` 恢复后；
+   - 恢复点：**新进程** Continue（`MC_POST_GAME_STARTED(continued=true)` 且内存里没有 `runSeed`）。要求保存的 `seed` 与当前一致；
+     `stage` / `stageType` 两边都取得到时必须一致，否则忽略（防串档）；
+   - 续档点可能早于最后一次拾取（游戏存的是本房入口）：持久化里带最近 `PersistHistoryMax`（默认 32）条「帧号 → 袋内容」快照，
+     恢复时取 `frame <= 当前帧` 的最新一份，避免把退出前在本房捡的素材重复算进去；
+   - 清空点：新开一局（不 Continue）、`MC_POST_GAME_END(gameOver=true)`；
+   - 读写失败 / 版本不符 / 乱码一律降级：不崩溃，面板回到「未知，请按 F9 校正」；
+   - 装了 REPENTOGON 时逐帧直读仍是最强真值，会在恢复后的下一帧覆盖模拟值。
 
 ## 6. 目录结构与上传范围
 
-**上传用的核心代码 = `metadata.xml` + `main.lua` + `scripts/**/*.lua`**（共 11 个文件）。
-公开仓库 / 发布包里也只有这 11 个文件 + `README.md` / `.gitignore` / `.gitattributes` / `tools/package.ps1`；
+**上传用的核心代码 = `metadata.xml` + `main.lua` + `scripts/**/*.lua`**（共 12 个文件）。
+公开仓库 / 发布包里也只有这 12 个文件 + `README.md` / `.gitignore` / `.gitattributes` / `tools/package.ps1`；
 其余目录**只留在本地开发环境**，既不进公开仓库、也不进 zip。
 
 ```
@@ -300,10 +324,11 @@ scripts/
   recipe.lua                -- 配方 key（8 素材多重集）唯一口径：链搜索与配方史共用
   data/ingredients.lua      -- 素材表、估值、颜色、掉落物映射
   scan.lua                  -- 扫描房间/本层掉落物 + 背包卡牌药丸 → 素材计数
-  bag_tracker.lua           -- 模拟袋内 8 格（入袋归属 / 轮转 / 合成清空 / 配方史 / 校正 / 可信度）
+  bag_tracker.lua           -- 模拟袋内 8 格（入袋归属 / 轮转 / 合成清空 / 配方史 / 校正 / 可信度 / 持久化导入导出）
   bag_editor.lua            -- F9 校正编辑器的状态机（不含绘制）
   chain.lua                 -- 最优放置链搜索（Beam Search + 协程分帧）
   ui.lua                    -- HUD 面板绘制（字体与渲染接口自适应）
+  persist.lua               -- 跨会话持久化：紧凑文本编解码 + 按恢复帧挑快照 + ModData 读写
 
 # ---- 只留在本地（不在公开仓库里，也不上传） ----
 README.md                   -- 本开发文档（工坊页面另填）
@@ -314,7 +339,9 @@ tools/package.ps1           -- 打包脚本（白名单 → dist\CainsBag + zip�
 
 `tests/` 里各文件：`stub_isaac.lua`（原生 API 桩）、`test_logic.lua`（映射 / 袋模拟 / 归属语义 / 否决 /
 合成清空 / 配方史 / 链搜索）、`test_bag_edit.lua`（F9 编辑器）、`test_fuzz.lua`（100 组随机场景）、
-`test_main.lua`（加载 main.lua 的集成测试）、`test_ui.lua`（字体与渲染探测）、`run_tests.py` / `run_one.py` /
+`test_persist.lua`（持久化编解码 / 快照选择 / ModData）、`test_main.lua`（加载 main.lua 的集成测试）、
+`test_panel.lua`（战斗中隐藏 / F5 三态 / F9 强制显示）、`test_persist_main.lua`（退出保存 → Continue 恢复 → rewind 更新 → 新局清空）、
+`test_ui.lua`（字体与渲染探测）、`run_tests.py` / `run_one.py` /
 `check_encoding.py`（测试入口与编码检查）、`perf.lua`（最坏情况性能参考）、
 `explore_reachable_bags.py`（早期穷举参考脚本，不参与自动测试）。
 
@@ -330,7 +357,7 @@ python tests/check_encoding.py  # UTF-8 无 BOM / 行尾检查
 python tests/run_one.py tests.perf   # 最坏情况性能参考
 ```
 
-当前结果：`run_tests.py` → **301 条断言全绿（0 失败）**；`check_encoding.py` → 29 个文件无问题。
+当前结果：`run_tests.py` → **362 条断言全绿（0 失败）**；`check_encoding.py` → 34 个文件无问题。
 
 > GitHub Actions 工作流（`.github/workflows/tests.yml`，Windows + Python 3.11/3.12）在本地保留，
 > 与 `tests/` 一样不随公开仓库上传；要启用 CI 就把 `.gitignore` 里的 `tests/`、`.github/` 去掉再提交。
@@ -396,6 +423,11 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 | `late touch: bag entry reverted seed=.. ids=.. reason=player-pickup-late` | 碰撞记录晚于 Collect 首帧到达 ⇒ 撤销刚写入的袋内容（先记后撤） |
 | `rewind detected (source) / rewind applied (source=.. frame=.. bagRestored=.. rooms=N)` | 控制台 `rewind`：检测到同一局帧号倒退 + 恢复结果（袋 / 本层房间数） |
 | `rewind: bag restored at frame=F (snapshot frame=S) -> [..]` | 袋内容已恢复到目标帧 F 的状态（快照帧 S）；没有这行说明没有可用快照 |
+| `panel mode=auto visible=false (combat)` / `panel mode=auto visible=true` / `panel mode=off visible=false (off)` | 面板显示模式与最终可见性（只在变化时写一条）；`(combat)` = 战斗中隐藏，`(off)` = F5 关闭 |
+| `persist: saved frame=F bag=[..] (reason)` | 写入模组数据（`game-exit` / `new-room` / `throttle` / `rewind`） |
+| `persist: restored frame=F (snapshot S[, fallback]) bag=[..] recipes=N` | 续档恢复成功；`fallback` = 恢复帧早于所有快照，退回了最早一份 |
+| `persist: cleared (new-run / game-over)` | 新开一局 / 游戏结束 ⇒ 清空模组数据 |
+| `persist: ignored (no data / corrupt / version N / seed mismatch / stage mismatch / restore failed)` | 持久化数据不可用 ⇒ 降级为 `unknown`（按 F9 校正） |
 | `scan vanished: seed=.. idx=.. dist=.. swipe=0/1 nearest=..` | 两帧扫描之间消失、且从未见过 `Collect` 的掉落物（当前只记录、不判定）：用于排查「一次吸多个偶发漏 1 个」 |
 | `room-entry pending: seed=.. idx=.. dist=.. swipe=0/1 src=..` | 换房保护帧内被吸收的掉落物（当前不判定）：同上，用于量化漏记 |
 | `font ok/skip`、`UI init:`、`render geom:` | 字体与渲染探测（见 §5 第 2 条） |
@@ -407,7 +439,7 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
   「真正合成（袋被清空）」时记录；实测需求是「只要在合成袋里满 8 格出现过，之后就别再推荐」——因此实现为：
   袋满 8 格的每一种来源（袋吸收 / REPENTOGON 直读 / F9 校正）都立即登记该多重集，`Clear()` 时再补登记一次
   并把「真的合成过」标出来（UI 因此分成 `（已出现）` 与 `（已合成）`）。计数器 / 卡牌槽否决回滚入袋时会撤销
-  那次登记。配方史只在本局内存里有效（不读写存档），`F6` / `F9` 不清空，新局 / 续档 / 复活清空。
+  那次登记。配方史现在会用模组数据跨会话保留（见 §5 第 8 条；`F6` / `F9` 不清空，新局 / 复活清空）。
 - 剪枝：除了「无新配方且袋多重集不变」的纯浪费动作外，不丢弃「重复配方但改变袋内容」的动作。
   原因是这类动作有时是结构调整的必经之路（先换成已见过的袋，再走向新配方），丢掉会漏掉更优链。
 - 素材计数上限用 `MaxCountPerType`（默认 24）代替「单个种类最多 8」：一次袋只有 8 格，
@@ -439,6 +471,14 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
   「续档」整体清空 ⇒ 面板上的袋内容与本层掉落物全丢。现在按 `Game():GetFrameCount()` 记录袋内容与本层房间扫描快照，
   检测到同一局帧号倒退后恢复到目标帧（`config.RewindFrames` 控制保留窗口，默认 3 分钟）；没有快照时降级为 `unknown`（提示 F9）。
   换层不再整体清空 `Scan`，而是按楼层标识过滤。
+- **面板战斗中隐藏（0.10.0）**：`state.visible` 改为「最终是否绘制」的派生值，由 `panelMode` 决定：
+  `auto`（默认，`Room:IsClear()` 为 false 且超过 `CombatHideGraceFrames` 才隐藏）、`on`（始终显示）、`off`（始终不显示）。
+  `F5` 循环三态；`F9` 校正期间强制显示（`off` 模式下按 F9 会先切回 `auto`）；隐藏时不绘制也不跑链搜索，
+  重新显示后 `chainKey` 为空会自然重算；面板可见性只在变化时写一条 `panel mode=...` 日志。
+- **跨会话持久化（0.10.0）**：`scripts/persist.lua` 用自带紧凑文本 + 版本号，通过 `Isaac.SaveModData/LoadModData`
+  按存档位保存（**不直接读写游戏存档文件**）。保存点：`MC_PRE_GAME_EXIT` / `MC_POST_NEW_ROOM` / 变化后节流 / `rewind` 后；
+  恢复点：新进程 Continue（`seed` 相同、`stage`·`stageType` 一致），按 `Game():GetFrameCount()` 从最近 32 条快照里挑
+  `frame <= 恢复帧` 的最新一份；新局与 `gameOver` 清空。解析失败一律降级 `unknown`，不崩溃。
 
 ## 10. 发布 / 上传
 
@@ -489,4 +529,4 @@ dist\CainsBag.zip            ← 解压后得到 mods\CainsBag\...
 - 游戏内 `Mods` → 选中本模组 → `Upload`，游戏会读取 `metadata.xml`；
 - 上传前把 `<visibility>` 从 `Private` 改成 `Public`（**只影响工坊可见性，不影响 GitHub**）；
 - `<id>` 目前是占位值，只在工坊上传流程里才需要唯一 id，纯 GitHub 分发可以不管；
-- 每次发版同步改 `metadata.xml` 的 `<version>`（当前 `0.9.0`），工坊端才能正确提示更新。
+- 每次发版同步改 `metadata.xml` 的 `<version>`（当前 `0.10.0`），工坊端才能正确提示更新。

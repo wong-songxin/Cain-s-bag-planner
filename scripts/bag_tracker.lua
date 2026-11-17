@@ -13,6 +13,7 @@ local config = require("scripts.config")
 local Log = require("scripts.log")
 local Ingredients = require("scripts.data.ingredients")
 local Recipe = require("scripts.recipe")
+local Persist = require("scripts.persist")
 
 local BagTracker = {}
 
@@ -1414,6 +1415,201 @@ function BagTracker.OnGameStarted(isContinued)
     else
         BagTracker.Calibrate()
     end
+end
+
+-- ------------------------------------------------------------
+-- 跨会话持久化（step7-B）：只读导出 / 导入
+-- main.lua 在「新进程续档」时把 scripts.persist 解出来的 payload 交给这里恢复。
+-- 说明：恢复的是「模拟」状态；装了 REPENTOGON 时逐帧直读会在下一帧覆盖为真值。
+-- ------------------------------------------------------------
+
+local function sanitizeSlots(list)
+    if type(list) ~= "table" then
+        return nil
+    end
+    local result = {}
+    for i = 1, #list do
+        local id = list[i]
+        if type(id) ~= "number" or id % 1 ~= 0 or id < 1 or id > Ingredients.MAX_ID then
+            return nil
+        end
+        result[#result + 1] = id
+    end
+    if #result > BAG_SIZE then
+        return nil
+    end
+    return result
+end
+
+-- 导出给 scripts.persist：当前槽位 + 最近 N 条袋快照 + 配方史（保持首次记录顺序）
+function BagTracker.GetPersistState()
+    local max = tonumber(config.PersistHistoryMax) or 32
+    if max < 1 then
+        max = 1
+    end
+    local history = {}
+    local from = math.max(1, #bagHistory - max + 1)
+    for i = from, #bagHistory do
+        history[#history + 1] = { frame = bagHistory[i].frame, slots = copyList(bagHistory[i].slots) }
+    end
+    local seen = {}
+    for i = 1, #seenRecipeOrder do
+        seen[i] = seenRecipeOrder[i]
+    end
+    local crafted = {}
+    for key in pairs(craftedRecipes) do
+        crafted[#crafted + 1] = key
+    end
+    table.sort(crafted)
+    return { slots = copyList(slots), history = history, seen = seen, crafted = crafted }
+end
+
+-- payload（scripts.persist 解码结果）→ 袋模拟 + 配方史；按恢复帧挑快照
+-- 返回 ok, snapshotFrame, fallback（fallback=true：恢复帧早于所有快照，退回了最早一份）
+function BagTracker.RestoreFromPersist(payload, restoreFrame)
+    if type(payload) ~= "table" then
+        return false, nil, false
+    end
+    local savedSlots = sanitizeSlots(payload.slots)
+    if savedSlots == nil then
+        return false, nil, false
+    end
+
+    local target = tonumber(restoreFrame)
+    if target == nil then
+        target = tonumber(payload.frame)
+    end
+    if target == nil then
+        target = gameFrame
+    end
+
+    local snapshot, fallback = Persist.SelectSnapshot(payload, target)
+    local restoredSlots = savedSlots
+    local snapshotFrame = target
+    if snapshot ~= nil then
+        local list = sanitizeSlots(snapshot.slots)
+        if list ~= nil then
+            restoredSlots = list
+            snapshotFrame = snapshot.frame
+        end
+    end
+
+    -- 清逐帧缓存（不调用 Reset：Reset 会清空配方史，而配方史要从持久化里恢复）
+    known = {}
+    touched = {}
+    pushed = {}
+    skipLog = {}
+    attrLogged = {}
+    pushedInfo = {}
+    collideLogged = {}
+    vanishedLogged = {}
+    roomEntryLogged = {}
+    pendingVeto = {}
+    pendingChecks = {}
+    counterHistory = {}
+    chargeWatch = nil
+    lastCharge = nil
+    lastChargeMax = nil
+    lastCollectibleCount = nil
+    activeSnapshot = nil
+    craftHoldFrames = 0
+    cardSignature = nil
+    cardSignatureTick = -100
+    dropHeldByController = {}
+    collectors = {}
+    tracking = false
+    bagPlayerIndex = nil
+    bagPlayer = nil
+    playerX = nil
+    playerY = nil
+    ignoreTicks = 2      -- 刚恢复时避免把换房残留的 Index 当成新拾取
+    swipeUntil = -1000
+    tick = 0
+
+    slots = copyList(restoredSlots)
+
+    -- 配方史：seen 保持原顺序；crafted 是其中真的合成过的子集
+    for key in pairs(seenRecipes) do
+        seenRecipes[key] = nil
+    end
+    for key in pairs(recipeUses) do
+        recipeUses[key] = nil
+    end
+    for key in pairs(craftedRecipes) do
+        craftedRecipes[key] = nil
+    end
+    for i = #seenRecipeOrder, 1, -1 do
+        seenRecipeOrder[i] = nil
+    end
+
+    local restoredRecipes = 0
+    if type(payload.seen) == "table" then
+        for i = 1, #payload.seen do
+            local key = payload.seen[i]
+            if type(key) == "string" and seenRecipes[key] == nil then
+                seenRecipes[key] = true
+                recipeUses[key] = 1
+                seenRecipeOrder[#seenRecipeOrder + 1] = key
+                restoredRecipes = restoredRecipes + 1
+            end
+        end
+    end
+    if type(payload.crafted) == "table" then
+        for i = 1, #payload.crafted do
+            local key = payload.crafted[i]
+            if type(key) == "string" and seenRecipes[key] == true then
+                craftedRecipes[key] = true
+            end
+        end
+    end
+    if restoredRecipes > 0 then
+        bumpRecipeRevision()
+    end
+
+    -- 帧号 + 历史快照：之后的 rewind 也要能按这里的数据回到正确时点
+    gameFrame = target
+    bagHistory = {}
+    local history = payload.history
+    if type(history) == "table" then
+        for i = 1, #history do
+            local entry = history[i]
+            -- 只保留恢复帧（含）之前的快照：之后的属于「被放弃的时间线」，玩家可能换了操作
+            if type(entry) == "table" and type(entry.frame) == "number"
+                and entry.frame >= 0 and entry.frame <= target then
+                local list = sanitizeSlots(entry.slots)
+                if list ~= nil then
+                    bagHistory[#bagHistory + 1] = { frame = entry.frame, slots = list }
+                end
+            end
+        end
+        table.sort(bagHistory, function(a, b)
+            return a.frame < b.frame
+        end)
+    end
+    -- 把恢复出的当前状态并入历史（保持按帧号递增；同帧以恢复值为准）
+    local placed = false
+    for i = 1, #bagHistory do
+        if bagHistory[i].frame == target then
+            bagHistory[i].slots = copyList(slots)
+            placed = true
+            break
+        end
+        if bagHistory[i].frame > target then
+            table.insert(bagHistory, i, { frame = target, slots = copyList(slots) })
+            placed = true
+            break
+        end
+    end
+    if not placed then
+        bagHistory[#bagHistory + 1] = { frame = target, slots = copyList(slots) }
+    end
+
+    setConfidence("known", "restored")
+    Log.Write(string.format(
+        "[CainsBag] bag restored from persist: frame=%s snapshot=%s fallback=%s bag=[%s] recipes=%d",
+        tostring(target), tostring(snapshotFrame), tostring(fallback == true),
+        table.concat(slots, ","), #seenRecipeOrder))
+    return true, snapshotFrame, fallback == true
 end
 
 -- ------------------------------------------------------------

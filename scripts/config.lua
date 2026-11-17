@@ -10,11 +10,20 @@ local config = {
     -- 左上角画一个自检标记（"CB <drawApi>"）：看得到 = 渲染通道通；发布时可改 false
     DebugMarker = true,
 
-    -- 进入一局后是否默认显示面板
+    -- 面板显示模式（F5 循环：auto → on → off → auto）
+    --   auto = 清房显示、战斗中隐藏（默认）
+    --   on   = 始终显示（战斗中也不隐藏）
+    --   off  = 始终不显示（连链搜索一起停）
+    PanelMode = "auto",
+    -- 兼容旧配置：只有 PanelMode 缺省 / 非法时才用它推导初始模式（true → auto，false → off）
     PanelVisibleByDefault = true,
+    -- auto 模式：战斗中隐藏面板（Game():GetRoom():IsClear() == false）
+    HideDuringCombat = true,
+    -- 进房后连续这么多帧仍未清房才隐藏（避免敌人还没刷全时闪一下）
+    CombatHideGraceFrames = 30,
 
     -- 热键（键码见 resources/scripts/enums.lua 的 Keyboard 枚举）
-    HotkeyToggle = Keyboard.KEY_F5,        -- 开/关面板
+    HotkeyToggle = Keyboard.KEY_F5,        -- 循环面板显示模式（auto → on → off → auto）
     HotkeyCalibrate = Keyboard.KEY_F6,     -- 把本地模拟校准为空袋（想录入真实袋内容请用 F9）
     HotkeyRecalc = Keyboard.KEY_F7,        -- 强制重算
     HotkeyLanguage = Keyboard.KEY_F8,      -- 切换中文 / 英文（字体不含中文字形时很有用）
@@ -54,6 +63,12 @@ local config = {
     -- 控制台 rewind / 时间回溯：按游戏帧号保留最近的袋内容与掉落物扫描快照，
     -- 回退（同一局 + 帧号倒退）后恢复到目标帧的状态，而不是把面板信息清空。
     RewindFrames = 10800,          -- 最多保留多少帧历史（60fps ≈ 3 分钟）；0 = 关闭（回退后按未知处理）
+
+    -- 跨会话持久化（退出游戏再进入 / Continue 时恢复袋内容与配方史）
+    -- 硬约束：只用 Isaac.SaveModData/LoadModData（模组数据，按存档位隔离），绝不直接读写游戏存档文件
+    Persist = true,                -- 总开关；false = 续档后按未知处理（需 F9）
+    PersistHistoryMax = 32,        -- 持久化包里保留的袋快照条数（按恢复帧挑最新一份）
+    PersistFrameInterval = 60,     -- 袋 / 配方史变化后的写盘节流（帧）
 
     -- 袋内容来源
     DirectRead = true,             -- 检测到 REPENTOGON 时直接读取袋内容（不可用时自动退回事件模拟）
