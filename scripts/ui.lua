@@ -1049,7 +1049,7 @@ end
 -- 绘制入口（每帧调用，只做绘制）
 -- ------------------------------------------------------------
 function UI.Render(state)
-    if state == nil or not state.visible then
+    if state == nil or not state.visible or state.eligible == false then
         return
     end
     if drawApi == "none" then

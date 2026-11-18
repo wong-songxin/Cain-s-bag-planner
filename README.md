@@ -36,9 +36,9 @@
 | **step5：出现过的配方去重 + 去掉 Tab 范围切换**（满 8 格出现过即拉黑，见 §9） | ✅ 离线 | `scripts/recipe.lua`、`chain.lua`、`bag_tracker.lua`、`main.lua`、`ui.lua` |
 | **bug 修复（step6）**：双素材掉落物按「一次拾取 = 一个动作」建模；已有另一个主动道具时合成主动也会清空 | ✅ 离线 | `chain.lua`、`ui.lua`、`bag_tracker.lua` |
 | **bug 修复（step7）**：控制台 `rewind` 后合成袋 / 本层掉落物信息按目标帧恢复（不再丢失）；普通拾取 vs 袋吸收改用「Q 是否举起 + 位置是否重叠」判定；**收集者名单收窄为官方 5 个 bum 跟班**（捐款机等 slot 不再误伤） | ✅ 离线（待实机复验） | `bag_tracker.lua`、`scan.lua`、`main.lua`、`config.lua` |
-| **0.10.0（step7 交接）**：面板战斗中默认隐藏（F5 三态 `auto/on/off`、F9 强制显示、隐藏时停链搜索）；退出游戏再进入（Continue）时按模组数据恢复袋内容与配方史 | ✅ 离线（待实机复验） | `main.lua`、`scripts/persist.lua`、`bag_tracker.lua`、`config.lua`、`ui.lua` |
+| **0.10.0（step7 交接）**：面板战斗中默认隐藏（F5 三态 `auto/on/off`、F9 强制显示、隐藏时停链搜索）；退出游戏再进入（Continue）时按模组数据恢复袋内容与配方史；**仅堕化该隐或持有合成袋时运行** | ✅ 离线（待实机复验） | `main.lua`、`scripts/persist.lua`、`bag_tracker.lua`、`config.lua`、`ui.lua` |
 | REPENTOGON 直读（可选、自动探测、异常回退事件模拟） | ⚠️ 代码就绪，本机未装未实测 | `bag_tracker.detectDirectRead / readDirectBag` |
-| 离线测试 | ✅ 362 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
+| 离线测试 | ✅ 375 条断言全绿 | `python tests/run_tests.py`、`python tests/check_encoding.py` |
 
 **待验证 / 待办（按优先级）**
 
@@ -58,6 +58,8 @@
 9. **跨会话持久化的实机复验**：退出到桌面 → 重启 → Continue，日志应出现 `persist: saved ...` / `persist: restored frame=..`，
    面板直接显示退出前的 8 格与配方史；**重点核对游戏续档点是否落在本房入口**（`history` 会按恢复帧挑快照，最多 32 条）；
    以及多个存档位之间互不串数据（`Isaac.SaveModData` 本身按存档位隔离）；
+10. **运行条件的实机复验**：普通角色无袋时不出现面板 / 不响应 F5·F9 / 日志为 `inactive: ...`；中途拿到合成袋后自动出现；
+    多人游戏里确认选中的是「有袋玩家 / 堕化该隐玩家」。
 
 ## 1. 安装
 
@@ -307,6 +309,10 @@ REPENTOGON 可用？
    - 清空点：新开一局（不 Continue）、`MC_POST_GAME_END(gameOver=true)`；
    - 读写失败 / 版本不符 / 乱码一律降级：不崩溃，面板回到「未知，请按 F9 校正」；
    - 装了 REPENTOGON 时逐帧直读仍是最强真值，会在恢复后的下一帧覆盖模拟值。
+9. **运行条件（0.10.0）**：只有当前玩家是**堕化该隐**（`GetPlayerType() == 23`）或**持有合成袋**（`HasCollectible(710)`）时才运行。
+   两者都不满足时：不绘制面板、不扫描房间 / 本层、不更新袋模拟、不响应 F5/F6/F7/F8/F9、不写持久化（`panelHidden="inactive"`）；
+   普通角色中途拿到合成袋会自动启用，袋子被顶掉 / 丢掉后自动停用（日志：`active: ...` / `inactive: ...`）。
+   多人游戏时按「有袋的玩家 → 堕化该隐玩家 → 1P」的顺序选目标玩家。
 
 ## 6. 目录结构与上传范围
 
@@ -341,7 +347,7 @@ tools/package.ps1           -- 打包脚本（白名单 → dist\CainsBag + zip�
 合成清空 / 配方史 / 链搜索）、`test_bag_edit.lua`（F9 编辑器）、`test_fuzz.lua`（100 组随机场景）、
 `test_persist.lua`（持久化编解码 / 快照选择 / ModData）、`test_main.lua`（加载 main.lua 的集成测试）、
 `test_panel.lua`（战斗中隐藏 / F5 三态 / F9 强制显示）、`test_persist_main.lua`（退出保存 → Continue 恢复 → rewind 更新 → 新局清空）、
-`test_ui.lua`（字体与渲染探测）、`run_tests.py` / `run_one.py` /
+`test_gate.lua`（运行条件：堕化该隐 / 持有合成袋）、`test_ui.lua`（字体与渲染探测）、`run_tests.py` / `run_one.py` /
 `check_encoding.py`（测试入口与编码检查）、`perf.lua`（最坏情况性能参考）、
 `explore_reachable_bags.py`（早期穷举参考脚本，不参与自动测试）。
 
@@ -357,7 +363,7 @@ python tests/check_encoding.py  # UTF-8 无 BOM / 行尾检查
 python tests/run_one.py tests.perf   # 最坏情况性能参考
 ```
 
-当前结果：`run_tests.py` → **362 条断言全绿（0 失败）**；`check_encoding.py` → 34 个文件无问题。
+当前结果：`run_tests.py` → **375 条断言全绿（0 失败）**；`check_encoding.py` → 35 个文件无问题。
 
 > GitHub Actions 工作流（`.github/workflows/tests.yml`，Windows + Python 3.11/3.12）在本地保留，
 > 与 `tests/` 一样不随公开仓库上传；要启用 CI 就把 `.gitignore` 里的 `tests/`、`.github/` 去掉再提交。
@@ -424,6 +430,7 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
 | `rewind detected (source) / rewind applied (source=.. frame=.. bagRestored=.. rooms=N)` | 控制台 `rewind`：检测到同一局帧号倒退 + 恢复结果（袋 / 本层房间数） |
 | `rewind: bag restored at frame=F (snapshot frame=S) -> [..]` | 袋内容已恢复到目标帧 F 的状态（快照帧 S）；没有这行说明没有可用快照 |
 | `panel mode=auto visible=false (combat)` / `panel mode=auto visible=true` / `panel mode=off visible=false (off)` | 面板显示模式与最终可见性（只在变化时写一条）；`(combat)` = 战斗中隐藏，`(off)` = F5 关闭 |
+| `active: Tainted Cain or has Bag of Crafting` / `inactive: not Tainted Cain and no Bag of Crafting` | 运行条件切换（只写一条）；不运行时面板 / 扫描 / 追踪 / 热键 / 持久化全部停用 |
 | `persist: saved frame=F bag=[..] (reason)` | 写入模组数据（`game-exit` / `new-room` / `throttle` / `rewind`） |
 | `persist: restored frame=F (snapshot S[, fallback]) bag=[..] recipes=N` | 续档恢复成功；`fallback` = 恢复帧早于所有快照，退回了最早一份 |
 | `persist: cleared (new-run / game-over)` | 新开一局 / 游戏结束 ⇒ 清空模组数据 |
@@ -479,6 +486,10 @@ python tests/run_one.py tests.perf   # 最坏情况性能参考
   按存档位保存（**不直接读写游戏存档文件**）。保存点：`MC_PRE_GAME_EXIT` / `MC_POST_NEW_ROOM` / 变化后节流 / `rewind` 后；
   恢复点：新进程 Continue（`seed` 相同、`stage`·`stageType` 一致），按 `Game():GetFrameCount()` 从最近 32 条快照里挑
   `frame <= 恢复帧` 的最新一份；新局与 `gameOver` 清空。解析失败一律降级 `unknown`，不崩溃。
+- **运行条件（0.10.0）**：`main.lua` 每帧用 `isEligiblePlayer()` 判定「堕化该隐（23）或持有合成袋（710）」；
+  不满足时 `state.eligible=false`：UI 直接返回、`updateState` 在扫描 / `BagTracker.Update` / 热键之前提前返回，
+  `OnPickupUpdate` / `NoteCollision` / 换房 / 换层 / 使用袋 / 复活 / 持久化保存等回调也全部短路。
+  状态切换写一条 `active: ...` / `inactive: ...` 日志；普通角色中途拿到或失去合成袋会实时切换。
 
 ## 10. 发布 / 上传
 

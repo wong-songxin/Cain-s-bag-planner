@@ -3,7 +3,7 @@
     <name>Cain's Bag Planner</name>
     <directory>CainsBag</directory>
     <id>1000000001</id>
-    <description>堕化该隐合成袋规划器：显示袋内 8 格 + “最多不同配方”的放置链；自动识别挥袋入袋、跳过普通拾取/使魔，合成后自动清空；出现过的配方不再重复推荐；战斗中自动隐藏面板，退出游戏再进入可恢复袋内容。F5 显示模式、F9 校正</description>
+    <description>堕化该隐合成袋规划器：显示袋内 8 格 + “最多不同配方”的放置链；自动识别挥袋入袋、跳过普通拾取/使魔，合成后自动清空；出现过的配方不再重复推荐；战斗中自动隐藏面板，退出游戏再进入可恢复袋内容；仅在堕化该隐或持有合成袋时运行。F5 显示模式、F9 校正</description>
     <version>0.10.0</version>
     <visibility>Private</visibility>
     <tag id="Lua"/>

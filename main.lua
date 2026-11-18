@@ -80,6 +80,7 @@ local state = {
     runSeed = nil,
     rewindPending = nil,
     gameStarted = false,        -- 本次进程是否已经走过 POST_GAME_STARTED（区分「新进程续档」）
+    eligible = false,           -- 是否满足运行条件：堕化该隐 或 持有合成袋
     -- 跨会话持久化：脏标记 / 上次写盘帧 / 上次写盘时的袋 + 配方史
     persistDirty = false,
     persistFrame = -1000,
@@ -198,6 +199,26 @@ local function getBagPlayer()
         return player
     end
     return nil
+end
+
+-- 运行条件（0.10.0）：只有「堕化该隐（playerType 23）」或「持有合成袋（710）」才运行本模组。
+-- 两者都不满足时：不绘制面板、不扫描、不更新袋模拟、不响应热键、不写持久化。
+local function isEligiblePlayer(player)
+    if player == nil then
+        return false
+    end
+    local hasBag = false
+    pcall(function()
+        hasBag = player:HasCollectible(CollectibleType.COLLECTIBLE_BAG_OF_CRAFTING) == true
+    end)
+    if hasBag then
+        return true
+    end
+    local playerType = nil
+    pcall(function()
+        playerType = player:GetPlayerType()
+    end)
+    return playerType == 23
 end
 
 -- 本层（已探索房间）+ 背包 → 可用素材（统计范围固定为本层，见 step5）
@@ -592,7 +613,7 @@ local function buildPersistPayload()
 end
 
 local function savePersist(reason)
-    if config.Persist == false or state.runSeed == nil then
+    if config.Persist == false or state.runSeed == nil or state.eligible ~= true then
         return false
     end
     local payload = buildPersistPayload()
@@ -730,6 +751,44 @@ local function updateState()
 
     local player = getBagPlayer()
     if player == nil then
+        -- 主菜单 / 还没生成玩家：一律视为不运行（避免把上一局的残留面板画出来）
+        state.eligible = false
+        state.visible = false
+        state.searching = false
+        return
+    end
+
+    -- 运行条件：堕化该隐 或 持有合成袋；不满足时整个模组停用（面板/扫描/追踪/热键/持久化）
+    local eligible = isEligiblePlayer(player)
+    if state.eligible ~= eligible then
+        state.eligible = eligible
+        if eligible then
+            log("active: Tainted Cain or has Bag of Crafting")
+            state.lastScanFrame = -100
+            state.lastLoggedSignature = nil
+            state.diagDone = false
+            state.panelVisibleKey = nil
+            state.chainKey = nil
+        else
+            log("inactive: not Tainted Cain and no Bag of Crafting")
+            BagEditor.Close(false)
+            state.visible = false
+            state.panelHidden = "inactive"
+            state.job = nil
+            state.result = nil
+            state.chainKey = nil
+            state.searching = false
+            state.progress = 0
+            state.editor = { active = false, cursor = 1, slots = {} }
+        end
+    end
+    if not eligible then
+        state.visible = false
+        state.panelHidden = "inactive"
+        state.searching = false
+        state.progress = 0
+        state.message = ""
+        state.messageUntil = 0
         return
     end
 
@@ -852,6 +911,10 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
     end
     local newProcessContinue = isContinued and not sameSession
     state.gameStarted = true
+    -- 运行条件（堕化该隐 / 持有合成袋）：取不到玩家时先按可运行处理，等第一帧再判定
+    local startPlayer = getBagPlayer()
+    local startEligible = (startPlayer == nil) or isEligiblePlayer(startPlayer)
+    state.eligible = startEligible
     Scan.ResetFloor()
     BagTracker.OnGameStarted(isContinued)
     BagEditor.Reset()
@@ -877,7 +940,9 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
 
     local restored = false
     if newProcessContinue then
-        if config.Persist ~= false and seed ~= nil then
+        if not startEligible then
+            log("persist: ignored (inactive)")
+        elseif config.Persist ~= false and seed ~= nil then
             restored = restorePersist(seed, frame)
         else
             log("persist: ignored (no seed)")
@@ -890,11 +955,14 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, isContinued)
     UI.Init()
     log("game started (continued=" .. tostring(isContinued) .. "), bag="
         .. BagTracker.GetConfidence() .. ", recipes=" .. tostring(BagTracker.GetCraftedCount())
-        .. ", persistRestored=" .. tostring(restored))
+        .. ", persistRestored=" .. tostring(restored) .. ", eligible=" .. tostring(state.eligible))
 end)
 
 -- 换层：本层掉落物记录由 Scan 按楼层标识过滤（不再整体清空，历史留给 rewind 恢复）
 mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, function()
+    if state.eligible ~= true then
+        return
+    end
     local _, frame = runInfo()
     if isFrameDrop(frame) then
         markRewind("new-level", frame)
@@ -906,6 +974,9 @@ end)
 
 -- 换房间：掉落物索引会重置，重新开始检测入袋
 mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, function()
+    if state.eligible ~= true then
+        return
+    end
     BagTracker.OnNewRoom()
     BagEditor.Close(true)
     state.chainKey = nil
@@ -928,7 +999,7 @@ end)
 
 -- 复活 / 中途加入：袋内容模拟可能已经和真实脱节（E6）
 mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, function(_, player)
-    if player == nil then
+    if player == nil or state.eligible ~= true then
         return
     end
     -- rewind：等 applyRewind 恢复，不要把它当成“复活”置为未知
@@ -950,7 +1021,7 @@ end)
 
 -- 取用合成袋（袋满才会真正合成 → 清空袋内 8 格）
 mod:AddCallback(ModCallbacks.MC_PRE_USE_ITEM, function(_, collectible, rng, player, useFlags, slot)
-    if collectible ~= CollectibleType.COLLECTIBLE_BAG_OF_CRAFTING then
+    if state.eligible ~= true or collectible ~= CollectibleType.COLLECTIBLE_BAG_OF_CRAFTING then
         return
     end
     if slot ~= nil and slot ~= 0 then
@@ -971,7 +1042,7 @@ end)
 
 -- 记录“谁碰过这个掉落物”：玩家 / 使魔 / Bumbino / Ultra Greed 精确区分（E3）
 mod:AddCallback(ModCallbacks.MC_PRE_PICKUP_COLLISION, function(_, pickup, collider, low)
-    if pickup == nil or collider == nil then
+    if state.eligible ~= true or pickup == nil or collider == nil then
         return
     end
     BagTracker.NoteCollision(pickup, collider)
@@ -979,6 +1050,9 @@ end)
 
 -- 逐帧捕获 Collect 动画首帧（E2：不再依赖每 2 帧轮询）
 mod:AddCallback(ModCallbacks.MC_POST_PICKUP_UPDATE, function(_, pickup)
+    if state.eligible ~= true then
+        return
+    end
     BagTracker.OnPickupUpdate(pickup)
 end)
 
